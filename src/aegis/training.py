@@ -131,6 +131,26 @@ def _load_session_dict(session: SessionPair) -> dict[str, np.ndarray]:
     return {"image": data, "label": mask}
 
 
+def _parallel_load_sessions(sessions: list[SessionPair]) -> list[dict[str, np.ndarray]]:
+    """Load all sessions in parallel using a thread pool."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    data_dicts: list[dict[str, np.ndarray]] = [{}] * len(sessions)
+    n_workers = min(8, len(sessions))
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        future_to_idx = {
+            pool.submit(_load_session_dict, session): i
+            for i, session in enumerate(sessions)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            data_dicts[idx] = future.result()
+
+    logger.info("Loaded %d sessions using %d threads.", len(sessions), n_workers)
+    return data_dicts
+
+
 def create_patch_dataset(
     sessions: list[SessionPair],
     patch_size: tuple[int, int, int],
@@ -141,9 +161,7 @@ def create_patch_dataset(
     if not sessions:
         raise ValueError("sessions list must not be empty")
 
-    data_dicts: list[dict[str, np.ndarray]] = []
-    for session in sessions:
-        data_dicts.append(_load_session_dict(session))
+    data_dicts = _parallel_load_sessions(sessions)
 
     keys = ["image", "label"]
 
@@ -172,7 +190,7 @@ def create_patch_dataset(
             ToTensord(keys=keys),
         ])
 
-    return CacheDataset(data=data_dicts, transform=transforms, cache_rate=1.0)
+    return CacheDataset(data=data_dicts, transform=transforms, cache_rate=1.0, num_workers=4)
 
 
 def _compute_val_dice(
@@ -222,8 +240,15 @@ def train_model(
         val_sessions, config.patch_size, config.samples_per_volume, is_train=False
     )
 
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
+    use_cuda = device.type == "cuda"
+    train_loader = DataLoader(
+        train_ds, batch_size=config.batch_size, shuffle=True,
+        num_workers=4, pin_memory=use_cuda, persistent_workers=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=config.batch_size, shuffle=False,
+        num_workers=2, pin_memory=use_cuda, persistent_workers=True,
+    )
 
     model = model.to(device)
     loss_fn = DiceCELoss(sigmoid=True)
