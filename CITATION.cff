@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: "AEGIS: A Protective Shield Against Silent AI Failures in Clinical Use"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Author"
+    given-names: "Your"
+    email: "your.email@example.com"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+repository-code: "https://github.com/ansulx/AEGIS"
+url: "https://github.com/ansulx/AEGIS"
+license: MIT
+version: 0.1.0
+date-released: 2026-02-23
+keywords:
+  - clinical AI
+  - AI safety
+  - silent failure detection
+  - guardrails
+  - medical AI
+  - MICCAI
+abstract: >
+  AEGIS is a framework and toolkit for detecting, monitoring, and mitigating
+  silent failures of AI systems in clinical use, providing guardrails and
+  auditability for AI-assisted clinical decision support.

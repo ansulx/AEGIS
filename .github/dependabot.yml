@@ -1,0 +1,8 @@
+# Dependabot: keep dependencies up to date (enables "Dependency review" and security badges)
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
