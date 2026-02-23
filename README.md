@@ -92,25 +92,88 @@ See [`docs/quickstart.md`](docs/quickstart.md) and [`examples/`](examples/) for 
 
 ---
 
+## MICCAI 2026 Full Run (Strict)
+
+```bash
+export PYTHONPATH=src
+python src/main.py full_run \
+  --baseline-config configs/default.yaml \
+  --main-config configs/phase2_swinunetr.yaml \
+  --run-name miccai2026_full
+```
+
+### What this does
+
+1. **Train** SwinUNETR on ADAM dataset with MC Dropout, early stopping, and mixed precision
+2. **Infer** on ADAM (train + holdout) and Indian (CAR + NCAR) datasets with MC Dropout uncertainty
+3. **Generate** per-case metrics CSV, NIfTI predictions + uncertainty maps, qualitative NPZ slices
+4. **Produce** publication-grade figures (cohort summaries, uncertainty correlation, best/worst gallery)
+5. **Run** failure-detection analysis (ROC/AUROC, calibration, optimal flagging threshold)
+
+### CLI Options
+
+| Flag | Description |
+|---|---|
+| `--allow-cpu` | Allow CPU fallback (default: strict GPU) |
+| `--force` | Overwrite existing output directory |
+| `--resume-from PATH` | Resume training from checkpoint |
+
+### Outputs
+
+```
+outputs/<run-name>/
+├── checkpoints/          # Model checkpoints (best, latest, periodic)
+├── predictions/          # NIfTI predicted masks by cohort
+├── uncertainty/          # NIfTI entropy/uncertainty maps by cohort
+├── qualitative/          # NPZ slices for visualization
+├── figures/              # Publication-grade PNG figures
+│   ├── panels/           # Per-case panels
+│   ├── cohort_summary.png
+│   ├── uncertainty_correlation.png
+│   └── best_worst_gallery.png
+├── failure_analysis/     # Failure-detection reports
+│   ├── failure_detection_report.json
+│   ├── roc_curve.png
+│   └── calibration.png
+└── reports/
+    ├── summary.json
+    ├── per_case_metrics.csv
+    └── resolved_config.json
+```
+
+---
+
 ## Project Structure
 
 ```
 AEGIS/
 ├── README.md
 ├── LICENSE
-├── CITATION.cff
 ├── requirements.txt
-├── pyproject.toml
+├── configs/
+│   ├── default.yaml            # Baseline config (locked parameters)
+│   └── phase2_swinunetr.yaml   # Experiment-specific config
 ├── src/
+│   ├── main.py                 # CLI entrypoint
 │   └── aegis/
 │       ├── __init__.py
+│       ├── data_loading.py     # Dataset loading + validation
+│       ├── research_pipeline.py # Main pipeline orchestrator
+│       ├── training.py         # Training loop (checkpointing, OOM-safe)
+│       ├── checkpoint.py       # Atomic checkpoint save/load/resume
+│       ├── mc_inference.py     # MC Dropout inference engine
+│       ├── visualization.py    # Publication-grade figure generation
+│       ├── failure_detection.py # ROC/AUROC, calibration, failure analysis
 │       ├── guardrails.py
 │       ├── monitor.py
+│       ├── models/
+│       │   ├── __init__.py
+│       │   └── swin_unetr.py  # SwinUNETR with MC Dropout
 │       └── evaluation/
-├── examples/
 ├── tests/
-├── docs/
-└── scripts/
+├── scripts/
+├── examples/
+└── docs/
 ```
 
 ---
