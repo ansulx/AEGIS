@@ -17,12 +17,13 @@ from monai.data import CacheDataset, DataLoader
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 from monai.transforms import (
-    CenterSpatialCropd,
     Compose,
     EnsureChannelFirstd,
     RandCropByPosNegLabeld,
     RandFlipd,
     RandRotate90d,
+    ResizeWithPadOrCropd,
+    SpatialPadd,
     ToTensord,
 )
 
@@ -134,6 +135,7 @@ def create_patch_dataset(
     if is_train:
         transforms = Compose([
             EnsureChannelFirstd(keys=keys, channel_dim="no_channel"),
+            SpatialPadd(keys=keys, spatial_size=patch_size),
             RandCropByPosNegLabeld(
                 keys=keys,
                 label_key="label",
@@ -151,7 +153,7 @@ def create_patch_dataset(
     else:
         transforms = Compose([
             EnsureChannelFirstd(keys=keys, channel_dim="no_channel"),
-            CenterSpatialCropd(keys=keys, roi_size=patch_size),
+            ResizeWithPadOrCropd(keys=keys, spatial_size=patch_size),
             ToTensord(keys=keys),
         ])
 
