@@ -41,6 +41,8 @@ class PipelineConfig:
     min_adam_train_cases: int = 5
     seed: int = 2026
     mc_samples: int = 20
+    mc_samples_train: int = 5
+    sw_batch_size: int = 8
     save_nifti_outputs: bool = True
     save_qualitative_npz: bool = True
     require_gpu: bool = False
@@ -195,17 +197,20 @@ def _run_mc_inference_on_session(
     outputs_dir: Path,
     rows: list[dict[str, Any]],
     has_gt: bool = True,
+    mc_samples_override: int | None = None,
 ) -> None:
     image_np, affine = _load_nifti(session.image_path)
     volume_tensor, _ = load_and_normalize_nifti(session.image_path, device)
     volume_3d = volume_tensor.squeeze(0)
 
+    n_mc = mc_samples_override if mc_samples_override is not None else config.mc_samples
     result: MCResult = mc_dropout_inference(
         model=model,
         volume_tensor=volume_3d,
-        mc_samples=config.mc_samples,
+        mc_samples=n_mc,
         device=device,
         patch_size=tuple(config.patch_size),
+        sw_batch_size=config.sw_batch_size,
     )
 
     gt_mask = None
@@ -273,6 +278,7 @@ def _run_mc_inference_on_image_only(
         mc_samples=config.mc_samples,
         device=device,
         patch_size=tuple(config.patch_size),
+        sw_batch_size=config.sw_batch_size,
     )
 
     predictions_dir = _ensure_dir(outputs_dir / "predictions" / cohort_name)
@@ -406,27 +412,52 @@ def run_research_pipeline(
 
     case_rows: list[dict[str, Any]] = []
 
-    logger.info("Running MC inference on ADAM train (%d sessions)...", len(adam_train))
-    for session in sorted(adam_train, key=lambda s: s.session_id):
-        _run_mc_inference_on_session(model, session, "adam_train", cfg, device, out, case_rows)
+    import time as _time
 
-    logger.info("Running MC inference on ADAM holdout (%d sessions)...", len(adam_holdout))
-    for session in sorted(adam_holdout, key=lambda s: s.session_id):
+    logger.info(
+        "Running MC inference on ADAM train (%d sessions, %d MC samples, sw_batch=%d)...",
+        len(adam_train), cfg.mc_samples_train, cfg.sw_batch_size,
+    )
+    for i, session in enumerate(sorted(adam_train, key=lambda s: s.session_id), 1):
+        t0 = _time.monotonic()
+        _run_mc_inference_on_session(
+            model, session, "adam_train", cfg, device, out, case_rows,
+            mc_samples_override=cfg.mc_samples_train,
+        )
+        logger.info("  [%d/%d] %s done (%.1fs)", i, len(adam_train), session.session_id, _time.monotonic() - t0)
+
+    logger.info(
+        "Running MC inference on ADAM holdout (%d sessions, %d MC samples)...",
+        len(adam_holdout), cfg.mc_samples,
+    )
+    for i, session in enumerate(sorted(adam_holdout, key=lambda s: s.session_id), 1):
+        t0 = _time.monotonic()
         _run_mc_inference_on_session(model, session, "adam_holdout", cfg, device, out, case_rows)
+        logger.info("  [%d/%d] %s done (%.1fs)", i, len(adam_holdout), session.session_id, _time.monotonic() - t0)
 
-    logger.info("Running MC inference on Indian CAR (%d sessions)...", len(bundle.indian_car_sessions))
-    for session in sorted(bundle.indian_car_sessions, key=lambda s: s.session_id):
+    logger.info(
+        "Running MC inference on Indian CAR (%d sessions, %d MC samples)...",
+        len(bundle.indian_car_sessions), cfg.mc_samples,
+    )
+    for i, session in enumerate(sorted(bundle.indian_car_sessions, key=lambda s: s.session_id), 1):
+        t0 = _time.monotonic()
         _run_mc_inference_on_session(
             model, session, "indian_car_inference_only", cfg, device, out, case_rows
         )
+        logger.info("  [%d/%d] %s done (%.1fs)", i, len(bundle.indian_car_sessions), session.session_id, _time.monotonic() - t0)
 
-    logger.info("Running MC inference on Indian NCAR (%d images)...", len(bundle.indian_ncar_images))
-    for image_path in sorted(bundle.indian_ncar_images):
+    logger.info(
+        "Running MC inference on Indian NCAR (%d images, %d MC samples)...",
+        len(bundle.indian_ncar_images), cfg.mc_samples,
+    )
+    for i, image_path in enumerate(sorted(bundle.indian_ncar_images), 1):
+        t0 = _time.monotonic()
         session_id = image_path.stem.replace(".nii", "")
         _run_mc_inference_on_image_only(
             model, image_path, session_id,
             "indian_ncar_inference_only", cfg, device, out, case_rows,
         )
+        logger.info("  [%d/%d] %s done (%.1fs)", i, len(bundle.indian_ncar_images), session_id, _time.monotonic() - t0)
 
     per_case_csv = reports_dir / "per_case_metrics.csv"
     _write_case_rows_csv(case_rows, per_case_csv)
