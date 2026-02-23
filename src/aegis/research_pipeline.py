@@ -341,6 +341,7 @@ def run_research_pipeline(
     base_dir: Optional[Path | str] = None,
     config: Optional[PipelineConfig] = None,
     resume_from: Optional[Path | str] = None,
+    skip_training: bool = False,
 ) -> dict[str, Any]:
     """Execute strict ADAM-train/Indian-inference pipeline with real SwinUNETR model."""
     cfg = config or PipelineConfig()
@@ -395,16 +396,23 @@ def run_research_pipeline(
     )
 
     resume_path = Path(resume_from) if resume_from else None
-    best_ckpt = train_model(
-        model=model,
-        train_sessions=adam_train,
-        val_sessions=adam_holdout,
-        config=training_cfg,
-        device=device,
-        checkpoint_dir=checkpoint_dir,
-        resume_from=resume_path,
-    )
-    logger.info("Training complete. Best checkpoint: %s", best_ckpt)
+
+    if skip_training:
+        if resume_path is None:
+            raise ValueError("skip_training=True requires resume_from checkpoint path")
+        best_ckpt = resume_path
+        logger.info("Skipping training — loading checkpoint: %s", best_ckpt)
+    else:
+        best_ckpt = train_model(
+            model=model,
+            train_sessions=adam_train,
+            val_sessions=adam_holdout,
+            config=training_cfg,
+            device=device,
+            checkpoint_dir=checkpoint_dir,
+            resume_from=resume_path,
+        )
+        logger.info("Training complete. Best checkpoint: %s", best_ckpt)
 
     load_checkpoint(best_ckpt, model, device=device)
     model.to(device)

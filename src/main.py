@@ -164,6 +164,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resume-from", type=Path, default=None,
         help="Path to checkpoint to resume training from.",
     )
+    full_run.add_argument(
+        "--skip-training", action="store_true",
+        help="Skip training and go straight to inference using --resume-from checkpoint.",
+    )
     return parser
 
 
@@ -198,11 +202,18 @@ def _handle_full_run(args: argparse.Namespace) -> int:
         logging.info("CUDA version: %s", torch.version.cuda)
     logging.info("=" * 60)
 
+    skip_training = bool(getattr(args, "skip_training", False))
+    resume_path = args.resume_from
+    if skip_training and resume_path is None:
+        logging.error("--skip-training requires --resume-from <checkpoint>")
+        return 1
+
     summary = run_research_pipeline(
         output_dir=output_dir,
         base_dir=repo_root,
         config=config,
-        resume_from=args.resume_from,
+        resume_from=resume_path,
+        skip_training=skip_training,
     )
 
     reports_dir = output_dir / "reports"
