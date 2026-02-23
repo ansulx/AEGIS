@@ -1,0 +1,324 @@
+"""Training loop for 3D cerebrovascular aneurysm segmentation on ADAM sessions."""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import nibabel as nib
+import numpy as np
+import torch
+import torch.nn as nn
+from monai.data import CacheDataset, DataLoader
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric
+from monai.transforms import (
+    CenterSpatialCropd,
+    Compose,
+    EnsureChannelFirstd,
+    RandCropByPosNegLabeld,
+    RandFlipd,
+    RandRotate90d,
+    ToTensord,
+)
+
+from aegis.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
+from aegis.data_loading import SessionPair
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    """Immutable training hyper-parameters with validation."""
+
+    num_epochs: int = 100
+    batch_size: int = 1
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-5
+    patch_size: tuple[int, int, int] = (96, 96, 96)
+    samples_per_volume: int = 4
+    val_interval: int = 5
+    early_stopping_patience: int = 15
+    gradient_clip_max_norm: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.num_epochs <= 0:
+            raise ValueError(f"num_epochs must be positive, got {self.num_epochs}")
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
+        if self.weight_decay <= 0:
+            raise ValueError(f"weight_decay must be positive, got {self.weight_decay}")
+        if self.samples_per_volume <= 0:
+            raise ValueError(f"samples_per_volume must be positive, got {self.samples_per_volume}")
+        if self.val_interval <= 0:
+            raise ValueError(f"val_interval must be positive, got {self.val_interval}")
+        if self.early_stopping_patience <= 0:
+            raise ValueError(
+                f"early_stopping_patience must be positive, got {self.early_stopping_patience}"
+            )
+        if self.gradient_clip_max_norm <= 0:
+            raise ValueError(
+                f"gradient_clip_max_norm must be positive, got {self.gradient_clip_max_norm}"
+            )
+        for i, dim in enumerate(self.patch_size):
+            if dim <= 0:
+                raise ValueError(f"patch_size[{i}] must be positive, got {dim}")
+            if dim % 32 != 0:
+                raise ValueError(
+                    f"patch_size[{i}] must be a multiple of 32, got {dim}"
+                )
+
+
+def load_and_normalize_nifti(
+    path: Path, device: torch.device
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Load a NIfTI volume, percentile-clip (1-99), z-score normalize.
+
+    Returns (tensor on *device* with shape (1, D, H, W), affine).
+    """
+    img = nib.load(path)
+    affine: np.ndarray = np.array(img.affine, dtype=np.float64)
+    data = np.asarray(img.dataobj, dtype=np.float32)
+
+    if not np.all(np.isfinite(data)):
+        logger.warning("Non-finite values in %s — replacing with 0", path.name)
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+    p1, p99 = float(np.percentile(data, 1)), float(np.percentile(data, 99))
+    data = np.clip(data, p1, p99)
+
+    std = float(data.std())
+    if std < 1e-6:
+        logger.warning("Near-constant volume %s (std=%.2e) — returning zeros", path.name, std)
+        data = np.zeros_like(data)
+    else:
+        mean = float(data.mean())
+        data = (data - mean) / std
+
+    tensor = torch.from_numpy(data).unsqueeze(0).to(device)  # (1, D, H, W)
+    return tensor, affine
+
+
+def _load_session_dict(session: SessionPair, device: torch.device) -> dict[str, torch.Tensor]:
+    image, _ = load_and_normalize_nifti(session.image_path, device=torch.device("cpu"))
+    mask_img = nib.load(session.mask_path)
+    mask = np.asarray(mask_img.dataobj, dtype=np.float32)
+    mask = (mask > 0.5).astype(np.float32)
+    mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (1, D, H, W)
+    return {"image": image, "label": mask_tensor}
+
+
+def create_patch_dataset(
+    sessions: list[SessionPair],
+    patch_size: tuple[int, int, int],
+    samples_per_volume: int,
+    is_train: bool,
+) -> CacheDataset:
+    """Build a MONAI CacheDataset of patches from session pairs."""
+    if not sessions:
+        raise ValueError("sessions list must not be empty")
+
+    data_dicts: list[dict[str, torch.Tensor]] = []
+    for session in sessions:
+        data_dicts.append(_load_session_dict(session, torch.device("cpu")))
+
+    keys = ["image", "label"]
+
+    if is_train:
+        transforms = Compose([
+            EnsureChannelFirstd(keys=keys, channel_dim="no_channel"),
+            RandCropByPosNegLabeld(
+                keys=keys,
+                label_key="label",
+                spatial_size=patch_size,
+                pos=1.0,
+                neg=1.0,
+                num_samples=samples_per_volume,
+            ),
+            RandFlipd(keys=keys, prob=0.5, spatial_axis=0),
+            RandFlipd(keys=keys, prob=0.5, spatial_axis=1),
+            RandFlipd(keys=keys, prob=0.5, spatial_axis=2),
+            RandRotate90d(keys=keys, prob=0.5, max_k=3, spatial_axes=(0, 1)),
+            ToTensord(keys=keys),
+        ])
+    else:
+        transforms = Compose([
+            EnsureChannelFirstd(keys=keys, channel_dim="no_channel"),
+            CenterSpatialCropd(keys=keys, roi_size=patch_size),
+            ToTensord(keys=keys),
+        ])
+
+    return CacheDataset(data=data_dicts, transform=transforms, cache_rate=1.0)
+
+
+def _compute_val_dice(
+    model: nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+) -> float:
+    """Run validation and return mean Dice score."""
+    model.eval()
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits = model(images)
+            preds = (torch.sigmoid(logits) > 0.5).float()
+            dice_metric(y_pred=preds, y=labels)
+
+    mean_dice = dice_metric.aggregate().item()
+    dice_metric.reset()
+    return mean_dice
+
+
+def train_model(
+    model: nn.Module,
+    train_sessions: list[SessionPair],
+    val_sessions: list[SessionPair],
+    config: TrainingConfig,
+    device: torch.device,
+    checkpoint_dir: Path,
+    resume_from: Optional[Path] = None,
+) -> Path:
+    """Full training loop with mixed precision, early stopping, and checkpointing.
+
+    Returns the path to the best checkpoint.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    train_ds = create_patch_dataset(
+        train_sessions, config.patch_size, config.samples_per_volume, is_train=True
+    )
+    val_ds = create_patch_dataset(
+        val_sessions, config.patch_size, config.samples_per_volume, is_train=False
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
+
+    model = model.to(device)
+    loss_fn = DiceCELoss(sigmoid=True)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.num_epochs, eta_min=1e-7
+    )
+
+    start_epoch = 0
+    best_dice = 0.0
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    if resume_from is not None:
+        meta = load_checkpoint(resume_from, model, optimizer, scheduler, device=device)
+        start_epoch = meta["epoch"] + 1
+        best_dice = meta["best_dice"]
+        logger.info(
+            "Resumed from %s — epoch %d, best_dice=%.4f", resume_from.name, start_epoch, best_dice
+        )
+
+    epochs_without_improvement = 0
+    best_checkpoint_path = checkpoint_dir / "best_model.pt"
+    config_dict = dataclasses.asdict(config)
+
+    for epoch in range(start_epoch, config.num_epochs):
+        t0 = time.monotonic()
+        model.train()
+        epoch_loss = 0.0
+        batches_processed = 0
+
+        for batch in train_loader:
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+
+            try:
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits = model(images)
+                    loss = loss_fn(logits, labels)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_max_norm)
+                scaler.step(optimizer)
+                scaler.update()
+
+                epoch_loss += loss.item()
+                batches_processed += 1
+
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    "CUDA OOM at epoch %d — skipping batch, clearing cache", epoch
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+        scheduler.step()
+        elapsed = time.monotonic() - t0
+        avg_loss = epoch_loss / max(batches_processed, 1)
+        lr_now = optimizer.param_groups[0]["lr"]
+        logger.info(
+            "Epoch %03d/%03d  loss=%.4f  lr=%.2e  batches=%d  time=%.1fs",
+            epoch + 1,
+            config.num_epochs,
+            avg_loss,
+            lr_now,
+            batches_processed,
+            elapsed,
+        )
+
+        # --- Validation & checkpointing ---
+        if (epoch + 1) % config.val_interval == 0:
+            val_dice = _compute_val_dice(model, val_loader, device, use_amp)
+            logger.info("  val_dice=%.4f  (best=%.4f)", val_dice, best_dice)
+
+            if val_dice > best_dice:
+                best_dice = val_dice
+                epochs_without_improvement = 0
+                save_checkpoint(
+                    best_checkpoint_path, model, optimizer, scheduler, epoch, best_dice, config_dict
+                )
+                logger.info("  -> new best model saved")
+            else:
+                epochs_without_improvement += config.val_interval
+
+            if epochs_without_improvement >= config.early_stopping_patience:
+                logger.info(
+                    "Early stopping at epoch %d (no improvement for %d epochs)",
+                    epoch + 1,
+                    epochs_without_improvement,
+                )
+                break
+
+        if (epoch + 1) % 10 == 0:
+            periodic_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"
+            save_checkpoint(
+                periodic_path, model, optimizer, scheduler, epoch, best_dice, config_dict
+            )
+
+        latest_path = checkpoint_dir / "latest_model.pt"
+        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, best_dice, config_dict)
+
+    if not best_checkpoint_path.exists():
+        save_checkpoint(
+            best_checkpoint_path, model, optimizer, scheduler,
+            config.num_epochs - 1, best_dice, config_dict,
+        )
+        logger.info("No validation improvement recorded; saved final model as best checkpoint")
+
+    return best_checkpoint_path

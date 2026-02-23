@@ -48,9 +48,14 @@ Thumbs.db
 # data/
 # logs/
 # *.log
+/adam data/
+/Data_Set/
 
-# Model checkpoints (optional)
-# checkpoints/
-# *.pt
-# *.pth
-# *.ckpt
+# Pipeline outputs and checkpoints
+/outputs/
+*.pt
+*.pth
+*.ckpt
+
+# macOS metadata
+._*

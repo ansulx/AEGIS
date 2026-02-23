@@ -1,0 +1,6 @@
+experiment:
+  model_name: "phase2_swinunetr"
+  track_name: "miccai2026"
+  notes: "Strict ADAM-train and Indian-inference protocol with SwinUNETR + MC Dropout."
+
+pipeline: {}
