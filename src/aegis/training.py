@@ -107,13 +107,28 @@ def load_and_normalize_nifti(
     return tensor, affine
 
 
-def _load_session_dict(session: SessionPair, device: torch.device) -> dict[str, torch.Tensor]:
-    image, _ = load_and_normalize_nifti(session.image_path, device=torch.device("cpu"))
+def _load_session_dict(session: SessionPair) -> dict[str, np.ndarray]:
+    """Load a session as raw 3D numpy arrays (D, H, W) — no channel dim.
+
+    MONAI transforms (EnsureChannelFirstd) will add the channel later.
+    """
+    img = nib.load(session.image_path)
+    data = np.asarray(img.dataobj, dtype=np.float32)
+    if not np.all(np.isfinite(data)):
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+    p1, p99 = float(np.percentile(data, 1)), float(np.percentile(data, 99))
+    data = np.clip(data, p1, p99)
+    std = float(data.std())
+    if std < 1e-6:
+        data = np.zeros_like(data)
+    else:
+        data = (data - float(data.mean())) / std
+
     mask_img = nib.load(session.mask_path)
     mask = np.asarray(mask_img.dataobj, dtype=np.float32)
     mask = (mask > 0.5).astype(np.float32)
-    mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (1, D, H, W)
-    return {"image": image, "label": mask_tensor}
+
+    return {"image": data, "label": mask}
 
 
 def create_patch_dataset(
@@ -126,9 +141,9 @@ def create_patch_dataset(
     if not sessions:
         raise ValueError("sessions list must not be empty")
 
-    data_dicts: list[dict[str, torch.Tensor]] = []
+    data_dicts: list[dict[str, np.ndarray]] = []
     for session in sessions:
-        data_dicts.append(_load_session_dict(session, torch.device("cpu")))
+        data_dicts.append(_load_session_dict(session))
 
     keys = ["image", "label"]
 
