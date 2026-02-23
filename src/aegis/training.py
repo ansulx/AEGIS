@@ -297,6 +297,7 @@ def train_model(
     config_dict = dataclasses.asdict(config)
 
     warnings.filterwarnings("ignore", message=".*Num foregrounds.*unable to generate class balanced.*")
+    warnings.filterwarnings("ignore", message=".*non-tuple sequence for multidimensional indexing.*")
 
     for epoch in range(start_epoch, config.num_epochs):
         t0 = time.monotonic()
