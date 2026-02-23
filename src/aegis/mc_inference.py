@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn as nn
+from monai.inferers import sliding_window_inference
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +30,20 @@ def mc_dropout_inference(
     volume_tensor: torch.Tensor,
     mc_samples: int = 20,
     device: torch.device | str = "cpu",
+    patch_size: tuple[int, int, int] = (96, 96, 96),
+    sw_batch_size: int = 2,
+    overlap: float = 0.25,
 ) -> MCResult:
-    """Run MC Dropout inference on a single 3D volume.
+    """Run MC Dropout inference on a single 3D volume using sliding window.
 
     Args:
         model: Network with ``enable_mc_dropout`` / ``disable_mc_dropout`` methods.
         volume_tensor: Float32 tensor of shape (D, H, W) — already normalized.
         mc_samples: Number of stochastic forward passes (>= 2).
         device: Target compute device.
+        patch_size: Sliding window patch size (must match training patch size).
+        sw_batch_size: Number of patches processed in parallel during sliding window.
+        overlap: Fraction of overlap between adjacent sliding window patches.
 
     Returns:
         MCResult with binary mask, mean probability, entropy, trust score,
@@ -56,25 +63,35 @@ def mc_dropout_inference(
     model.to(device)
     model.enable_mc_dropout()
 
-    prob_sum = torch.zeros_like(x[:, 0])  # (1, D, H, W)
+    prob_sum = torch.zeros(1, *volume_tensor.shape, device=device, dtype=torch.float32)
     volume_fractions: list[float] = []
     completed = 0
     use_amp = device.type == "cuda"
 
     try:
         with torch.no_grad():
-            for i in range(mc_samples):
+            for _ in range(mc_samples):
                 try:
-                    if use_amp:
-                        with torch.amp.autocast("cuda"):
-                            logits = model(x)
-                    else:
-                        logits = model(x)
-                    probs = torch.sigmoid(logits[:, 0])  # (1, D, H, W)
-                    prob_sum += probs.float()
-                    volume_fractions.append(float(probs.mean().item()))
+                    def _predictor(patch: torch.Tensor) -> torch.Tensor:
+                        if use_amp:
+                            with torch.amp.autocast("cuda"):
+                                return torch.sigmoid(model(patch))
+                        return torch.sigmoid(model(patch))
+
+                    probs = sliding_window_inference(
+                        inputs=x,
+                        roi_size=patch_size,
+                        sw_batch_size=sw_batch_size,
+                        predictor=_predictor,
+                        overlap=overlap,
+                        mode="gaussian",
+                    )
+                    probs_squeezed = probs[:, 0].float()
+                    prob_sum += probs_squeezed
+                    volume_fractions.append(float(probs_squeezed.mean().item()))
                     completed += 1
                 except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
                     if completed >= 2:
                         warnings.warn(
                             f"CUDA OOM after {completed}/{mc_samples} MC passes; "
@@ -87,7 +104,7 @@ def mc_dropout_inference(
     finally:
         model.disable_mc_dropout()
 
-    mean_prob = prob_sum / completed  # (1, D, H, W)
+    mean_prob = prob_sum / completed
     eps = 1e-7
     p = torch.clamp(mean_prob, eps, 1.0 - eps)
     entropy = -(p * torch.log2(p) + (1.0 - p) * torch.log2(1.0 - p))

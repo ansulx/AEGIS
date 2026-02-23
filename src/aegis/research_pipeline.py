@@ -205,6 +205,7 @@ def _run_mc_inference_on_session(
         volume_tensor=volume_3d,
         mc_samples=config.mc_samples,
         device=device,
+        patch_size=tuple(config.patch_size),
     )
 
     gt_mask = None
@@ -271,6 +272,7 @@ def _run_mc_inference_on_image_only(
         volume_tensor=volume_3d,
         mc_samples=config.mc_samples,
         device=device,
+        patch_size=tuple(config.patch_size),
     )
 
     predictions_dir = _ensure_dir(outputs_dir / "predictions" / cohort_name)

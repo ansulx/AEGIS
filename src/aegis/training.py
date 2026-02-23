@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,7 +23,6 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     RandFlipd,
     RandRotate90d,
-    ResizeWithPadOrCropd,
     SpatialPadd,
     ToTensord,
 )
@@ -186,7 +186,7 @@ def create_patch_dataset(
     else:
         transforms = Compose([
             EnsureChannelFirstd(keys=keys, channel_dim="no_channel"),
-            ResizeWithPadOrCropd(keys=keys, spatial_size=patch_size),
+            SpatialPadd(keys=keys, spatial_size=patch_size),
             ToTensord(keys=keys),
         ])
 
@@ -198,22 +198,41 @@ def _compute_val_dice(
     val_loader: DataLoader,
     device: torch.device,
     use_amp: bool,
+    patch_size: tuple[int, int, int] = (96, 96, 96),
 ) -> float:
-    """Run validation and return mean Dice score."""
+    """Run validation with sliding window inference and return mean Dice score."""
+    from monai.inferers import sliding_window_inference
+
     model.eval()
-    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=True)
 
     with torch.no_grad():
         for batch in val_loader:
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = model(images)
+
+            if use_amp:
+                with torch.amp.autocast("cuda"):
+                    logits = sliding_window_inference(
+                        images, roi_size=patch_size, sw_batch_size=2,
+                        predictor=model, overlap=0.25, mode="gaussian",
+                    )
+            else:
+                logits = sliding_window_inference(
+                    images, roi_size=patch_size, sw_batch_size=2,
+                    predictor=model, overlap=0.25, mode="gaussian",
+                )
             preds = (torch.sigmoid(logits) > 0.5).float()
             dice_metric(y_pred=preds, y=labels)
 
-    mean_dice = dice_metric.aggregate().item()
+    result, not_nans = dice_metric.aggregate()
     dice_metric.reset()
+    if not_nans.item() < 1:
+        logger.warning("No valid Dice samples in validation; returning 0.0")
+        return 0.0
+    mean_dice = result.item()
+    if not np.isfinite(mean_dice):
+        return 0.0
     return mean_dice
 
 
@@ -246,7 +265,7 @@ def train_model(
         num_workers=4, pin_memory=use_cuda, persistent_workers=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=config.batch_size, shuffle=False,
+        val_ds, batch_size=1, shuffle=False,
         num_workers=2, pin_memory=use_cuda, persistent_workers=True,
     )
 
@@ -276,6 +295,8 @@ def train_model(
     epochs_without_improvement = 0
     best_checkpoint_path = checkpoint_dir / "best_model.pt"
     config_dict = dataclasses.asdict(config)
+
+    warnings.filterwarnings("ignore", message=".*Num foregrounds.*unable to generate class balanced.*")
 
     for epoch in range(start_epoch, config.num_epochs):
         t0 = time.monotonic()
@@ -326,7 +347,7 @@ def train_model(
 
         # --- Validation & checkpointing ---
         if (epoch + 1) % config.val_interval == 0:
-            val_dice = _compute_val_dice(model, val_loader, device, use_amp)
+            val_dice = _compute_val_dice(model, val_loader, device, use_amp, config.patch_size)
             logger.info("  val_dice=%.4f  (best=%.4f)", val_dice, best_dice)
 
             if val_dice > best_dice:
