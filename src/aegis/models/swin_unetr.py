@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn as nn
 from monai.networks.nets import SwinUNETR
@@ -42,17 +44,24 @@ class AegisSwinUNETR(nn.Module):
         self.out_channels = out_channels
         self.img_size = img_size
 
-        self.net = SwinUNETR(
-            img_size=img_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            feature_size=feature_size,
-            drop_rate=drop_rate,
-            attn_drop_rate=attn_drop_rate,
-            dropout_path_rate=dropout_path_rate,
-            spatial_dims=spatial_dims,
-            use_v2=True,
-        )
+        sig = inspect.signature(SwinUNETR.__init__)
+        params = set(sig.parameters.keys())
+
+        kwargs: dict = {
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "feature_size": feature_size,
+            "drop_rate": drop_rate,
+            "attn_drop_rate": attn_drop_rate,
+            "dropout_path_rate": dropout_path_rate,
+            "spatial_dims": spatial_dims,
+        }
+        if "img_size" in params:
+            kwargs["img_size"] = img_size
+        if "use_v2" in params:
+            kwargs["use_v2"] = True
+
+        self.net = SwinUNETR(**kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 5:
