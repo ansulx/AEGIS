@@ -163,6 +163,22 @@ def create_patch_dataset(
 
     data_dicts = _parallel_load_sessions(sessions)
 
+    if is_train:
+        n_before = len(data_dicts)
+        positive_dicts = [d for d in data_dicts if d["label"].sum() > 0]
+        n_empty = n_before - len(positive_dicts)
+        if positive_dicts:
+            logger.info(
+                "Training filter: %d/%d sessions have foreground; "
+                "dropping %d empty-mask sessions.",
+                len(positive_dicts), n_before, n_empty,
+            )
+            data_dicts = positive_dicts
+        else:
+            logger.warning(
+                "All %d training masks are empty! Keeping all sessions.", n_before
+            )
+
     keys = ["image", "label"]
 
     if is_train:
@@ -173,7 +189,7 @@ def create_patch_dataset(
                 keys=keys,
                 label_key="label",
                 spatial_size=patch_size,
-                pos=1.0,
+                pos=3.0,
                 neg=1.0,
                 num_samples=samples_per_volume,
             ),
@@ -270,7 +286,7 @@ def train_model(
     )
 
     model = model.to(device)
-    loss_fn = DiceCELoss(sigmoid=True)
+    loss_fn = DiceCELoss(sigmoid=True, lambda_dice=1.0, lambda_ce=1.0)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
