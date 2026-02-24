@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import inspect
+import logging
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from monai.networks.nets import SwinUNETR
+
+logger = logging.getLogger(__name__)
+
+PRETRAINED_URL = (
+    "https://github.com/Project-MONAI/MONAI-extra-test-data/releases/"
+    "download/0.8.1/model_swinvit.pt"
+)
 
 
 class AegisSwinUNETR(nn.Module):
@@ -26,6 +35,7 @@ class AegisSwinUNETR(nn.Module):
         attn_drop_rate: float = 0.1,
         dropout_path_rate: float = 0.1,
         spatial_dims: int = 3,
+        use_pretrained: bool = False,
     ) -> None:
         super().__init__()
         if in_channels < 1:
@@ -63,6 +73,39 @@ class AegisSwinUNETR(nn.Module):
 
         self.net = SwinUNETR(**kwargs)
 
+        if use_pretrained:
+            self._load_pretrained_backbone()
+
+    def _load_pretrained_backbone(self) -> None:
+        """Load self-supervised pre-trained ViT backbone weights from MONAI."""
+        cache_dir = Path.home() / ".cache" / "aegis"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        weight_path = cache_dir / "model_swinvit.pt"
+
+        if not weight_path.exists():
+            logger.info("Downloading pre-trained SwinViT weights...")
+            torch.hub.download_url_to_file(PRETRAINED_URL, str(weight_path))
+            logger.info("Downloaded to %s", weight_path)
+
+        pretrained = torch.load(str(weight_path), map_location="cpu", weights_only=True)
+
+        model_dict = self.net.state_dict()
+        loaded = 0
+        skipped = 0
+        for key, value in pretrained.items():
+            mapped_key = _map_pretrained_key(key)
+            if mapped_key in model_dict and model_dict[mapped_key].shape == value.shape:
+                model_dict[mapped_key] = value
+                loaded += 1
+            else:
+                skipped += 1
+
+        self.net.load_state_dict(model_dict)
+        logger.info(
+            "Loaded %d/%d pre-trained backbone parameters (skipped %d)",
+            loaded, loaded + skipped, skipped,
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 5:
             raise ValueError(
@@ -84,3 +127,12 @@ class AegisSwinUNETR(nn.Module):
     def disable_mc_dropout(self) -> None:
         """Restore standard eval mode for all layers."""
         self.eval()
+
+
+def _map_pretrained_key(key: str) -> str:
+    """Map keys from the MONAI pre-trained checkpoint to SwinUNETR's swinViT."""
+    if key.startswith("module."):
+        key = key[len("module."):]
+    if not key.startswith("swinViT."):
+        key = "swinViT." + key
+    return key

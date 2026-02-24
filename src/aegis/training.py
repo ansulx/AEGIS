@@ -15,14 +15,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 from monai.data import CacheDataset, DataLoader
-from monai.losses import DiceCELoss
+from monai.losses import DiceFocalLoss
 from monai.metrics import DiceMetric
 from monai.transforms import (
     Compose,
     EnsureChannelFirstd,
     RandCropByPosNegLabeld,
     RandFlipd,
+    RandGaussianNoised,
+    RandGaussianSmoothd,
     RandRotate90d,
+    RandScaleIntensityd,
+    RandShiftIntensityd,
     SpatialPadd,
     ToTensord,
 )
@@ -37,15 +41,16 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """Immutable training hyper-parameters with validation."""
 
-    num_epochs: int = 100
-    batch_size: int = 1
-    learning_rate: float = 1e-4
+    num_epochs: int = 200
+    batch_size: int = 2
+    learning_rate: float = 2e-4
     weight_decay: float = 1e-5
     patch_size: tuple[int, int, int] = (96, 96, 96)
     samples_per_volume: int = 4
     val_interval: int = 5
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 30
     gradient_clip_max_norm: float = 1.0
+    warmup_epochs: int = 10
 
     def __post_init__(self) -> None:
         if self.num_epochs <= 0:
@@ -189,7 +194,7 @@ def create_patch_dataset(
                 keys=keys,
                 label_key="label",
                 spatial_size=patch_size,
-                pos=3.0,
+                pos=5.0,
                 neg=1.0,
                 num_samples=samples_per_volume,
             ),
@@ -197,6 +202,10 @@ def create_patch_dataset(
             RandFlipd(keys=keys, prob=0.5, spatial_axis=1),
             RandFlipd(keys=keys, prob=0.5, spatial_axis=2),
             RandRotate90d(keys=keys, prob=0.5, max_k=3, spatial_axes=(0, 1)),
+            RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.5),
+            RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
+            RandGaussianNoised(keys=["image"], prob=0.2, mean=0.0, std=0.1),
+            RandGaussianSmoothd(keys=["image"], prob=0.2, sigma_x=(0.5, 1.0), sigma_y=(0.5, 1.0), sigma_z=(0.5, 1.0)),
             ToTensord(keys=keys),
         ])
     else:
@@ -286,13 +295,13 @@ def train_model(
     )
 
     model = model.to(device)
-    loss_fn = DiceCELoss(sigmoid=True, lambda_dice=1.0, lambda_ce=1.0)
+    loss_fn = DiceFocalLoss(sigmoid=True, lambda_dice=1.0, lambda_focal=1.0, gamma=2.0)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.num_epochs, eta_min=1e-7
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-7, verbose=False
     )
 
     start_epoch = 0
@@ -317,6 +326,13 @@ def train_model(
 
     for epoch in range(start_epoch, config.num_epochs):
         t0 = time.monotonic()
+
+        # --- LR warmup ---
+        if epoch < config.warmup_epochs:
+            warmup_lr = config.learning_rate * (epoch + 1) / config.warmup_epochs
+            for pg in optimizer.param_groups:
+                pg["lr"] = warmup_lr
+
         model.train()
         epoch_loss = 0.0
         batches_processed = 0
@@ -348,7 +364,6 @@ def train_model(
                     torch.cuda.empty_cache()
                 continue
 
-        scheduler.step()
         elapsed = time.monotonic() - t0
         avg_loss = epoch_loss / max(batches_processed, 1)
         lr_now = optimizer.param_groups[0]["lr"]
@@ -366,6 +381,9 @@ def train_model(
         if (epoch + 1) % config.val_interval == 0:
             val_dice = _compute_val_dice(model, val_loader, device, use_amp, config.patch_size)
             logger.info("  val_dice=%.4f  (best=%.4f)", val_dice, best_dice)
+
+            if epoch >= config.warmup_epochs:
+                scheduler.step(val_dice)
 
             if val_dice > best_dice:
                 best_dice = val_dice
@@ -385,7 +403,6 @@ def train_model(
                 )
                 break
 
-        if (epoch + 1) % config.val_interval == 0:
             latest_path = checkpoint_dir / "latest_model.pt"
             save_checkpoint(latest_path, model, optimizer, scheduler, epoch, best_dice, config_dict)
 

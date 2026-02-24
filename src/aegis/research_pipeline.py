@@ -47,23 +47,25 @@ class PipelineConfig:
     save_qualitative_npz: bool = True
     require_gpu: bool = False
 
-    num_epochs: int = 100
-    batch_size: int = 1
-    learning_rate: float = 1e-4
+    num_epochs: int = 200
+    batch_size: int = 2
+    learning_rate: float = 2e-4
     weight_decay: float = 1e-5
     patch_size: tuple[int, int, int] = (96, 96, 96)
     samples_per_volume: int = 4
     val_interval: int = 5
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 30
     gradient_clip_max_norm: float = 1.0
+    warmup_epochs: int = 10
 
     img_size: tuple[int, int, int] = (96, 96, 96)
     feature_size: int = 48
     drop_rate: float = 0.1
     attn_drop_rate: float = 0.1
     dropout_path_rate: float = 0.1
+    use_pretrained: bool = True
 
-    failure_dice_threshold: float = 0.5
+    failure_dice_threshold: float = 0.1
     generate_figures: bool = True
     run_failure_analysis: bool = True
 
@@ -381,6 +383,7 @@ def run_research_pipeline(
         drop_rate=cfg.drop_rate,
         attn_drop_rate=cfg.attn_drop_rate,
         dropout_path_rate=cfg.dropout_path_rate,
+        use_pretrained=cfg.use_pretrained,
     ).to(device)
 
     training_cfg = TrainingConfig(
@@ -393,6 +396,7 @@ def run_research_pipeline(
         val_interval=cfg.val_interval,
         early_stopping_patience=cfg.early_stopping_patience,
         gradient_clip_max_norm=cfg.gradient_clip_max_norm,
+        warmup_epochs=cfg.warmup_epochs,
     )
 
     resume_path = Path(resume_from) if resume_from else None
