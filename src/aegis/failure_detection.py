@@ -115,10 +115,13 @@ def _load_cases(per_case_csv_path: Path) -> list[dict[str, Any]]:
             }
             rel_lr = _safe_float(raw.get("reliability_score_lr"))
             rel_mlp = _safe_float(raw.get("reliability_score_mlp"))
+            rel_rf = _safe_float(raw.get("reliability_score_rf"))
             if rel_lr is not None:
                 row_dict["reliability_score_lr"] = rel_lr
             if rel_mlp is not None:
                 row_dict["reliability_score_mlp"] = rel_mlp
+            if rel_rf is not None:
+                row_dict["reliability_score_rf"] = rel_rf
             rows.append(row_dict)
 
     return rows
@@ -308,14 +311,16 @@ def run_failure_detection_analysis(
     roc_tpr_rel: list[float] | None = None
 
     has_reliability = all(
-        c.get("reliability_score_mlp") is not None for c in cases
+        c.get("reliability_score_lr") is not None for c in cases
     )
     if has_reliability:
         rel_lr = np.array([float(c["reliability_score_lr"]) for c in cases])
-        rel_mlp = np.array([float(c["reliability_score_mlp"]) for c in cases])
-        failure_scores_rel = 1.0 - rel_mlp
+        rel_mlp = np.array([float(c.get("reliability_score_mlp", 0.5)) for c in cases])
+        rel_rf = np.array([float(c.get("reliability_score_rf", 0.5)) for c in cases])
+        best_rel = np.maximum(rel_lr, rel_rf)
+        failure_scores_rel = 1.0 - best_rel
         auroc_rel_lr = round(_compute_auroc(labels, 1.0 - rel_lr), 4)
-        auroc_rel_mlp = round(_compute_auroc(labels, failure_scores_rel), 4)
+        auroc_rel_mlp = round(_compute_auroc(labels, 1.0 - rel_mlp), 4)
         fpr_rel, tpr_rel, _ = roc_curve(labels, failure_scores_rel)
         roc_fpr_rel = [round(float(x), 6) for x in fpr_rel]
         roc_tpr_rel = [round(float(x), 6) for x in tpr_rel]

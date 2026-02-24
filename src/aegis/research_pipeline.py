@@ -361,7 +361,7 @@ def _write_case_rows_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "cohort", "session_id", "has_ground_truth",
         "dice", "iou", "sensitivity", "specificity", "precision",
         "trust_score", "volume_fraction_std",
-        "reliability_score_lr", "reliability_score_mlp",
+        "reliability_score_lr", "reliability_score_mlp", "reliability_score_rf",
         "qualitative_slice_index",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -545,10 +545,12 @@ def run_research_pipeline(
                 if pred:
                     row["reliability_score_lr"] = pred.reliability_score_lr
                     row["reliability_score_mlp"] = pred.reliability_score_mlp
+                    row["reliability_score_rf"] = pred.reliability_score_rf
 
             logger.info(
-                "Reliability module complete. CV AUROC — LR: %.4f, MLP: %.4f",
+                "Reliability module complete. CV AUROC — LR: %.4f, MLP: %.4f, RF: %.4f",
                 reliability_result.auroc_lr_cv, reliability_result.auroc_mlp_cv,
+                reliability_result.auroc_rf_cv,
             )
         except Exception:
             logger.warning("Reliability module failed.", exc_info=True)
@@ -601,9 +603,15 @@ def run_research_pipeline(
                 if reliability_result is not None
                 else None
             )
+            rf_feat_imp = (
+                reliability_result.rf_feature_importances
+                if reliability_result is not None
+                else None
+            )
             figure_paths = generate_all_figures(
                 out,
                 feature_importances=feat_imp,
+                rf_feature_importances=rf_feat_imp,
                 failure_dice_threshold=cfg.failure_dice_threshold,
             )
             summary["artifacts"]["figures"] = [str(p) for p in figure_paths]
@@ -632,12 +640,15 @@ def run_research_pipeline(
         summary["reliability_module"] = {
             "auroc_lr_cv_adam": reliability_result.auroc_lr_cv,
             "auroc_mlp_cv_adam": reliability_result.auroc_mlp_cv,
+            "auroc_rf_cv_adam": reliability_result.auroc_rf_cv,
             "auroc_lr_indian": reliability_result.auroc_lr_indian,
             "auroc_mlp_indian": reliability_result.auroc_mlp_indian,
+            "auroc_rf_indian": reliability_result.auroc_rf_indian,
             "n_train_cases": reliability_result.n_train_cases,
             "n_positive_train": reliability_result.n_positive_train,
             "n_indian_cases": reliability_result.n_indian_cases,
-            "feature_importances": reliability_result.feature_importances,
+            "feature_importances_lr": reliability_result.feature_importances,
+            "feature_importances_rf": reliability_result.rf_feature_importances,
         }
 
     summary_path = reports_dir / "summary.json"

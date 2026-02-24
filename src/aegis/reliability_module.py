@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 from scipy import ndimage, stats
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import LeaveOneOut, StratifiedKFold, cross_val_predict
@@ -70,6 +71,7 @@ class ReliabilityPrediction:
     cohort: str
     reliability_score_lr: float
     reliability_score_mlp: float
+    reliability_score_rf: float
 
 
 @dataclass
@@ -78,12 +80,15 @@ class ReliabilityModuleResult:
 
     auroc_lr_cv: float
     auroc_mlp_cv: float
+    auroc_rf_cv: float
     auroc_lr_indian: float | None
     auroc_mlp_indian: float | None
+    auroc_rf_indian: float | None
     n_train_cases: int
     n_positive_train: int
     n_indian_cases: int
     feature_importances: dict[str, float]
+    rf_feature_importances: dict[str, float]
     predictions: list[ReliabilityPrediction]
 
 
@@ -226,6 +231,7 @@ def train_and_evaluate_reliability(
             ReliabilityPrediction(
                 session_id=f.session_id, cohort=f.cohort,
                 reliability_score_lr=0.5, reliability_score_mlp=0.5,
+                reliability_score_rf=0.5,
             )
             for f in features_adam
         ]
@@ -234,6 +240,7 @@ def train_and_evaluate_reliability(
                 ReliabilityPrediction(
                     session_id=f.session_id, cohort=f.cohort,
                     reliability_score_lr=0.5, reliability_score_mlp=0.5,
+                    reliability_score_rf=0.5,
                 )
                 for f in features_indian
             ])
@@ -242,18 +249,22 @@ def train_and_evaluate_reliability(
                 ReliabilityPrediction(
                     session_id=f.session_id, cohort=f.cohort,
                     reliability_score_lr=0.5, reliability_score_mlp=0.5,
+                    reliability_score_rf=0.5,
                 )
                 for f in features_inference_only
             ])
         return ReliabilityModuleResult(
             auroc_lr_cv=0.5,
             auroc_mlp_cv=0.5,
+            auroc_rf_cv=0.5,
             auroc_lr_indian=None,
             auroc_mlp_indian=None,
+            auroc_rf_indian=None,
             n_train_cases=len(labels),
             n_positive_train=n_pos,
             n_indian_cases=len(features_indian) if features_indian else 0,
             feature_importances={},
+            rf_feature_importances={},
             predictions=predictions,
         )
 
@@ -273,31 +284,72 @@ def train_and_evaluate_reliability(
     mlp_pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", MLPClassifier(
-            hidden_layer_sizes=(128, 64),
+            hidden_layer_sizes=(16, 8),
             activation="relu",
-            alpha=1e-3,
-            max_iter=2000,
-            early_stopping=True,
-            validation_fraction=0.15,
+            alpha=0.1,
+            max_iter=3000,
+            early_stopping=False,
             random_state=2026,
         )),
     ])
+
+    rf_pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", RandomForestClassifier(
+            n_estimators=200,
+            max_depth=4,
+            min_samples_leaf=3,
+            class_weight="balanced",
+            random_state=2026,
+            n_jobs=-1,
+        )),
+    ])
+
+    rng = np.random.RandomState(2026)
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
         lr_probs_cv = cross_val_predict(lr_pipe, X, labels, cv=cv, method="predict_proba")[:, 1]
-        mlp_probs_cv = cross_val_predict(mlp_pipe, X, labels, cv=cv, method="predict_proba")[:, 1]
+        rf_probs_cv = cross_val_predict(rf_pipe, X, labels, cv=cv, method="predict_proba")[:, 1]
+
+        mlp_probs_cv = np.full(len(labels), 0.5)
+        for train_idx, test_idx in cv.split(X, labels):
+            X_tr, y_tr = X[train_idx], labels[train_idx]
+            minority_mask = y_tr == (1 if n_pos < n_neg else 0)
+            if minority_mask.sum() > 0 and minority_mask.sum() < len(y_tr):
+                majority_count = int((~minority_mask).sum())
+                minority_idx = np.where(minority_mask)[0]
+                oversample_idx = rng.choice(minority_idx, size=majority_count - len(minority_idx), replace=True)
+                X_tr = np.vstack([X_tr, X_tr[oversample_idx]])
+                y_tr = np.concatenate([y_tr, y_tr[oversample_idx]])
+            mlp_pipe.fit(X_tr, y_tr)
+            mlp_probs_cv[test_idx] = mlp_pipe.predict_proba(X[test_idx])[:, 1]
 
     auroc_lr_cv = _safe_auroc(labels, lr_probs_cv) or 0.5
     auroc_mlp_cv = _safe_auroc(labels, mlp_probs_cv) or 0.5
+    auroc_rf_cv = _safe_auroc(labels, rf_probs_cv) or 0.5
 
-    logger.info("Reliability CV AUROC — LR: %.4f, MLP: %.4f", auroc_lr_cv, auroc_mlp_cv)
+    logger.info(
+        "Reliability CV AUROC — LR: %.4f, MLP: %.4f, RF: %.4f",
+        auroc_lr_cv, auroc_mlp_cv, auroc_rf_cv,
+    )
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=ConvergenceWarning)
         lr_pipe.fit(X, labels)
-        mlp_pipe.fit(X, labels)
+        rf_pipe.fit(X, labels)
+
+        minority_mask_full = labels == (1 if n_pos < n_neg else 0)
+        if minority_mask_full.sum() > 0:
+            majority_count_full = int((~minority_mask_full).sum())
+            minority_idx_full = np.where(minority_mask_full)[0]
+            os_idx = rng.choice(minority_idx_full, size=majority_count_full - len(minority_idx_full), replace=True)
+            X_bal = np.vstack([X, X[os_idx]])
+            y_bal = np.concatenate([labels, labels[os_idx]])
+        else:
+            X_bal, y_bal = X, labels
+        mlp_pipe.fit(X_bal, y_bal)
 
     lr_coefs = lr_pipe.named_steps["clf"].coef_.ravel()
     scaler = lr_pipe.named_steps["scaler"]
@@ -312,6 +364,12 @@ def train_and_evaluate_reliability(
         for name, imp in zip(FEATURE_NAMES, importance)
     }
 
+    rf_importances = rf_pipe.named_steps["clf"].feature_importances_
+    rf_feature_importances = {
+        name: round(float(imp), 4)
+        for name, imp in zip(FEATURE_NAMES, rf_importances)
+    }
+
     predictions: list[ReliabilityPrediction] = []
     for i, feat in enumerate(features_adam):
         predictions.append(ReliabilityPrediction(
@@ -319,10 +377,12 @@ def train_and_evaluate_reliability(
             cohort=feat.cohort,
             reliability_score_lr=float(lr_probs_cv[i]),
             reliability_score_mlp=float(mlp_probs_cv[i]),
+            reliability_score_rf=float(rf_probs_cv[i]),
         ))
 
     auroc_lr_indian = None
     auroc_mlp_indian = None
+    auroc_rf_indian = None
 
     if features_indian and dice_scores_indian:
         X_indian = np.array([f.feature_vector for f in features_indian])
@@ -332,14 +392,16 @@ def train_and_evaluate_reliability(
 
         lr_probs_indian = lr_pipe.predict_proba(X_indian)[:, 1]
         mlp_probs_indian = mlp_pipe.predict_proba(X_indian)[:, 1]
+        rf_probs_indian = rf_pipe.predict_proba(X_indian)[:, 1]
 
         auroc_lr_indian = _safe_auroc(labels_indian, lr_probs_indian)
         auroc_mlp_indian = _safe_auroc(labels_indian, mlp_probs_indian)
+        auroc_rf_indian = _safe_auroc(labels_indian, rf_probs_indian)
 
         if auroc_lr_indian is not None:
             logger.info(
-                "Reliability Indian AUROC — LR: %.4f, MLP: %.4f",
-                auroc_lr_indian, auroc_mlp_indian or 0.0,
+                "Reliability Indian AUROC — LR: %.4f, MLP: %.4f, RF: %.4f",
+                auroc_lr_indian, auroc_mlp_indian or 0.0, auroc_rf_indian or 0.0,
             )
 
         for i, feat in enumerate(features_indian):
@@ -348,28 +410,34 @@ def train_and_evaluate_reliability(
                 cohort=feat.cohort,
                 reliability_score_lr=float(lr_probs_indian[i]),
                 reliability_score_mlp=float(mlp_probs_indian[i]),
+                reliability_score_rf=float(rf_probs_indian[i]),
             ))
 
     if features_inference_only:
         X_infer = np.array([f.feature_vector for f in features_inference_only])
         lr_probs_infer = lr_pipe.predict_proba(X_infer)[:, 1]
         mlp_probs_infer = mlp_pipe.predict_proba(X_infer)[:, 1]
+        rf_probs_infer = rf_pipe.predict_proba(X_infer)[:, 1]
         for i, feat in enumerate(features_inference_only):
             predictions.append(ReliabilityPrediction(
                 session_id=feat.session_id,
                 cohort=feat.cohort,
                 reliability_score_lr=float(lr_probs_infer[i]),
                 reliability_score_mlp=float(mlp_probs_infer[i]),
+                reliability_score_rf=float(rf_probs_infer[i]),
             ))
 
     return ReliabilityModuleResult(
         auroc_lr_cv=round(auroc_lr_cv, 4),
         auroc_mlp_cv=round(auroc_mlp_cv, 4),
+        auroc_rf_cv=round(auroc_rf_cv, 4),
         auroc_lr_indian=round(auroc_lr_indian, 4) if auroc_lr_indian is not None else None,
         auroc_mlp_indian=round(auroc_mlp_indian, 4) if auroc_mlp_indian is not None else None,
+        auroc_rf_indian=round(auroc_rf_indian, 4) if auroc_rf_indian is not None else None,
         n_train_cases=len(labels),
         n_positive_train=n_pos,
         n_indian_cases=len(features_indian) if features_indian else 0,
         feature_importances=feature_importances,
+        rf_feature_importances=rf_feature_importances,
         predictions=predictions,
     )

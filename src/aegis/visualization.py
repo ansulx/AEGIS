@@ -446,6 +446,7 @@ def generate_roc_comparison_figure(
 
     has_lr = "reliability_score_lr" in gt_df.columns and gt_df["reliability_score_lr"].notna().all()
     has_mlp = "reliability_score_mlp" in gt_df.columns and gt_df["reliability_score_mlp"].notna().all()
+    has_rf = "reliability_score_rf" in gt_df.columns and gt_df["reliability_score_rf"].notna().all()
 
     if has_lr:
         rel_lr = 1.0 - gt_df["reliability_score_lr"].values
@@ -460,6 +461,13 @@ def generate_roc_comparison_figure(
         auc_mlp = roc_auc_score(labels, rel_mlp)
         ax.plot(fpr_mlp, tpr_mlp, color="#2ca02c", lw=2.0, linestyle="-.",
                 label=f"Reliability MLP (AUROC = {auc_mlp:.3f})")
+
+    if has_rf:
+        rel_rf = 1.0 - gt_df["reliability_score_rf"].values
+        fpr_rf, tpr_rf, _ = sk_roc_curve(labels, rel_rf)
+        auc_rf = roc_auc_score(labels, rel_rf)
+        ax.plot(fpr_rf, tpr_rf, color="#d62728", lw=2.0, linestyle="-",
+                label=f"Reliability RF (AUROC = {auc_rf:.3f})")
 
     ax.plot([0, 1], [0, 1], "k:", lw=0.8, alpha=0.5, label="Random")
     ax.set_xlabel("False Positive Rate", fontsize=11)
@@ -483,29 +491,37 @@ def generate_roc_comparison_figure(
 def generate_feature_importance_figure(
     feature_importances: dict[str, float],
     out_path: Path | str,
+    rf_feature_importances: dict[str, float] | None = None,
 ) -> Path:
-    """Horizontal bar chart of LR-derived feature importances for the reliability module."""
+    """Horizontal bar chart of feature importances for the reliability module."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)
-    names = [f[0] for f in sorted_features]
-    values = [f[1] for f in sorted_features]
+    has_rf = rf_feature_importances is not None and len(rf_feature_importances) > 0
+    ncols = 2 if has_rf else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, max(4, len(feature_importances) * 0.35)))
+    if ncols == 1:
+        axes = [axes]
 
-    fig, ax = plt.subplots(figsize=(8, max(4, len(names) * 0.35)))
-
-    colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(names)))
-    bars = ax.barh(range(len(names)), values, color=colors, edgecolor="k", linewidth=0.3)
-    ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel("Relative Importance", fontsize=10)
-    ax.set_title("Reliability Module — Feature Importances (LR)", fontsize=12)
-
-    for bar, val in zip(bars, values):
-        if val > 0.01:
-            ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
-                    f"{val:.3f}", va="center", fontsize=7)
+    for ax, imp, title, cmap_name in [
+        (axes[0], feature_importances, "Feature Importances (LR)", "viridis"),
+    ] + ([
+        (axes[1], rf_feature_importances, "Feature Importances (RF)", "plasma"),
+    ] if has_rf else []):
+        sorted_feat = sorted(imp.items(), key=lambda x: x[1], reverse=True)
+        names = [f[0] for f in sorted_feat]
+        values = [f[1] for f in sorted_feat]
+        colors = getattr(plt.cm, cmap_name)(np.linspace(0.3, 0.9, len(names)))
+        bars = ax.barh(range(len(names)), values, color=colors, edgecolor="k", linewidth=0.3)
+        ax.set_yticks(range(len(names)))
+        ax.set_yticklabels(names, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel("Relative Importance", fontsize=10)
+        ax.set_title(title, fontsize=12)
+        for bar, val in zip(bars, values):
+            if val > 0.01:
+                ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
+                        f"{val:.3f}", va="center", fontsize=7)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -520,6 +536,7 @@ def generate_feature_importance_figure(
 def generate_all_figures(
     output_dir: Path | str,
     feature_importances: dict[str, float] | None = None,
+    rf_feature_importances: dict[str, float] | None = None,
     failure_dice_threshold: float = 0.1,
 ) -> list[Path]:
     """Generate all publication figures from pipeline outputs.
@@ -629,7 +646,8 @@ def generate_all_figures(
             if feature_importances:
                 try:
                     path = generate_feature_importance_figure(
-                        feature_importances, figures_dir / "feature_importances.png"
+                        feature_importances, figures_dir / "feature_importances.png",
+                        rf_feature_importances=rf_feature_importances,
                     )
                     generated.append(path)
                 except Exception:
