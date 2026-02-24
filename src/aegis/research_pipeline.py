@@ -14,6 +14,7 @@ import csv
 import json
 import logging
 import random
+import time as _time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -459,18 +460,17 @@ def run_research_pipeline(
     rel_features_indian: list[ReliabilityFeatures] = []
     rel_features_ncar: list[ReliabilityFeatures] = []
 
-    import time as _time
-
+    adam_train_mc = cfg.mc_samples if cfg.run_reliability_module else cfg.mc_samples_train
     logger.info(
         "Running MC inference on ADAM train (%d sessions, %d MC samples, sw_batch=%d)...",
-        len(adam_train), cfg.mc_samples_train, cfg.sw_batch_size,
+        len(adam_train), adam_train_mc, cfg.sw_batch_size,
     )
     for i, session in enumerate(sorted(adam_train, key=lambda s: s.session_id), 1):
         t0 = _time.monotonic()
         _run_mc_inference_on_session(
             model, session, "adam_train", cfg, device, out, case_rows,
             rel_features=rel_features_adam,
-            mc_samples_override=cfg.mc_samples_train,
+            mc_samples_override=adam_train_mc,
         )
         logger.info("  [%d/%d] %s done (%.1fs)", i, len(adam_train), session.session_id, _time.monotonic() - t0)
 
@@ -526,6 +526,11 @@ def run_research_pipeline(
                 for r in case_rows
                 if r["cohort"] == "indian_car_inference_only" and r.get("has_ground_truth")
             ]
+
+            if len(rel_features_adam) != len(dice_adam):
+                raise RuntimeError(
+                    f"Feature/dice length mismatch: {len(rel_features_adam)} features vs {len(dice_adam)} dice scores"
+                )
 
             reliability_result = train_and_evaluate_reliability(
                 features_adam=rel_features_adam,
@@ -628,6 +633,7 @@ def run_research_pipeline(
                 "auroc_trust_vs_failure": fa_result.auroc_trust_vs_failure,
                 "auroc_reliability_lr": fa_result.auroc_reliability_lr,
                 "auroc_reliability_mlp": fa_result.auroc_reliability_mlp,
+                "auroc_reliability_rf": fa_result.auroc_reliability_rf,
                 "optimal_trust_threshold": fa_result.optimal_trust_threshold,
                 "workload_reduction_fraction": fa_result.workload_reduction_fraction,
                 "missed_failure_rate": fa_result.missed_failure_rate,

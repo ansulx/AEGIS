@@ -316,13 +316,17 @@ def train_and_evaluate_reliability(
         mlp_probs_cv = np.full(len(labels), 0.5)
         for train_idx, test_idx in cv.split(X, labels):
             X_tr, y_tr = X[train_idx], labels[train_idx]
-            minority_mask = y_tr == (1 if n_pos < n_neg else 0)
-            if minority_mask.sum() > 0 and minority_mask.sum() < len(y_tr):
-                majority_count = int((~minority_mask).sum())
-                minority_idx = np.where(minority_mask)[0]
-                oversample_idx = rng.choice(minority_idx, size=majority_count - len(minority_idx), replace=True)
-                X_tr = np.vstack([X_tr, X_tr[oversample_idx]])
-                y_tr = np.concatenate([y_tr, y_tr[oversample_idx]])
+            fold_pos = int((y_tr == 1).sum())
+            fold_neg = len(y_tr) - fold_pos
+            if fold_pos > 0 and fold_neg > 0 and fold_pos != fold_neg:
+                local_minority = 1 if fold_pos < fold_neg else 0
+                minority_idx = np.where(y_tr == local_minority)[0]
+                majority_count = len(y_tr) - len(minority_idx)
+                n_extra = majority_count - len(minority_idx)
+                if n_extra > 0:
+                    oversample_idx = rng.choice(minority_idx, size=n_extra, replace=True)
+                    X_tr = np.vstack([X_tr, X_tr[oversample_idx]])
+                    y_tr = np.concatenate([y_tr, y_tr[oversample_idx]])
             mlp_pipe.fit(X_tr, y_tr)
             mlp_probs_cv[test_idx] = mlp_pipe.predict_proba(X[test_idx])[:, 1]
 
@@ -340,21 +344,23 @@ def train_and_evaluate_reliability(
         lr_pipe.fit(X, labels)
         rf_pipe.fit(X, labels)
 
-        minority_mask_full = labels == (1 if n_pos < n_neg else 0)
-        if minority_mask_full.sum() > 0:
-            majority_count_full = int((~minority_mask_full).sum())
-            minority_idx_full = np.where(minority_mask_full)[0]
-            os_idx = rng.choice(minority_idx_full, size=majority_count_full - len(minority_idx_full), replace=True)
-            X_bal = np.vstack([X, X[os_idx]])
-            y_bal = np.concatenate([labels, labels[os_idx]])
+        if n_pos > 0 and n_neg > 0 and n_pos != n_neg:
+            local_minority_full = 1 if n_pos < n_neg else 0
+            minority_idx_full = np.where(labels == local_minority_full)[0]
+            majority_count_full = len(labels) - len(minority_idx_full)
+            n_extra_full = majority_count_full - len(minority_idx_full)
+            if n_extra_full > 0:
+                os_idx = rng.choice(minority_idx_full, size=n_extra_full, replace=True)
+                X_bal = np.vstack([X, X[os_idx]])
+                y_bal = np.concatenate([labels, labels[os_idx]])
+            else:
+                X_bal, y_bal = X, labels
         else:
             X_bal, y_bal = X, labels
         mlp_pipe.fit(X_bal, y_bal)
 
     lr_coefs = lr_pipe.named_steps["clf"].coef_.ravel()
-    scaler = lr_pipe.named_steps["scaler"]
-    scaled_coefs = lr_coefs * scaler.scale_
-    abs_coefs = np.abs(scaled_coefs)
+    abs_coefs = np.abs(lr_coefs)
     if abs_coefs.sum() > 0:
         importance = abs_coefs / abs_coefs.sum()
     else:

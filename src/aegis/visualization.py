@@ -308,6 +308,7 @@ def generate_best_worst_gallery(
     gt_df = gt_df.sort_values("dice", ascending=False)
     best = gt_df.head(n_cases)
     worst = gt_df.tail(n_cases).iloc[::-1]
+    best_ids = set(best["session_id"].tolist())
     selected = pd.concat([best, worst], ignore_index=True)
 
     loaded_rows: list[dict[str, Any]] = []
@@ -329,7 +330,7 @@ def generate_best_worst_gallery(
             "pred": data["pred_slice"],
             "uncertainty": data["uncertainty_slice"],
             "gt": data["gt_slice"] if "gt_slice" in data else None,
-            "is_best": len(loaded_rows) < n_cases,
+            "is_best": sid in best_ids,
         })
 
     if not loaded_rows:

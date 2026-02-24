@@ -39,6 +39,7 @@ class FailureDetectionResult:
     auroc_vfstd_vs_failure: float
     auroc_reliability_lr: float | None
     auroc_reliability_mlp: float | None
+    auroc_reliability_rf: float | None
     optimal_trust_threshold: float
     optimal_trust_sensitivity: float
     optimal_trust_specificity: float
@@ -231,6 +232,7 @@ def run_failure_detection_analysis(
             auroc_vfstd_vs_failure=1.0,
             auroc_reliability_lr=None,
             auroc_reliability_mlp=None,
+            auroc_reliability_rf=None,
             optimal_trust_threshold=0.0,
             optimal_trust_sensitivity=1.0,
             optimal_trust_specificity=1.0,
@@ -253,6 +255,7 @@ def run_failure_detection_analysis(
             auroc_vfstd_vs_failure=0.5,
             auroc_reliability_lr=None,
             auroc_reliability_mlp=None,
+            auroc_reliability_rf=None,
             optimal_trust_threshold=1.0,
             optimal_trust_sensitivity=1.0,
             optimal_trust_specificity=0.0,
@@ -307,6 +310,7 @@ def run_failure_detection_analysis(
     # --- Reliability score AUROC (if column present) -----------------------
     auroc_rel_lr: float | None = None
     auroc_rel_mlp: float | None = None
+    auroc_rel_rf: float | None = None
     roc_fpr_rel: list[float] | None = None
     roc_tpr_rel: list[float] | None = None
 
@@ -317,16 +321,25 @@ def run_failure_detection_analysis(
         rel_lr = np.array([float(c["reliability_score_lr"]) for c in cases])
         rel_mlp = np.array([float(c.get("reliability_score_mlp", 0.5)) for c in cases])
         rel_rf = np.array([float(c.get("reliability_score_rf", 0.5)) for c in cases])
-        best_rel = np.maximum(rel_lr, rel_rf)
-        failure_scores_rel = 1.0 - best_rel
         auroc_rel_lr = round(_compute_auroc(labels, 1.0 - rel_lr), 4)
         auroc_rel_mlp = round(_compute_auroc(labels, 1.0 - rel_mlp), 4)
-        fpr_rel, tpr_rel, _ = roc_curve(labels, failure_scores_rel)
+        auroc_rel_rf = round(_compute_auroc(labels, 1.0 - rel_rf), 4)
+        best_auroc = max(
+            auroc_rel_lr if not math.isnan(auroc_rel_lr) else 0.0,
+            auroc_rel_rf if auroc_rel_rf is not None and not math.isnan(auroc_rel_rf) else 0.0,
+        )
+        if best_auroc == auroc_rel_lr:
+            best_rel_scores = rel_lr
+            best_rel_name = "LR"
+        else:
+            best_rel_scores = rel_rf
+            best_rel_name = "RF"
+        fpr_rel, tpr_rel, _ = roc_curve(labels, 1.0 - best_rel_scores)
         roc_fpr_rel = [round(float(x), 6) for x in fpr_rel]
         roc_tpr_rel = [round(float(x), 6) for x in tpr_rel]
         logger.info(
-            "Failure detection AUROC — trust: %.4f, reliability_lr: %.4f, reliability_mlp: %.4f",
-            auroc_trust, auroc_rel_lr, auroc_rel_mlp,
+            "Failure detection AUROC — trust: %.4f, rel_lr: %.4f, rel_mlp: %.4f, rel_rf: %.4f (best curve: %s)",
+            auroc_trust, auroc_rel_lr, auroc_rel_mlp, auroc_rel_rf, best_rel_name,
         )
 
     return FailureDetectionResult(
@@ -334,6 +347,7 @@ def run_failure_detection_analysis(
         auroc_vfstd_vs_failure=round(auroc_vfstd, 4),
         auroc_reliability_lr=auroc_rel_lr,
         auroc_reliability_mlp=auroc_rel_mlp,
+        auroc_reliability_rf=auroc_rel_rf,
         optimal_trust_threshold=round(optimal_trust_threshold, 4),
         optimal_trust_sensitivity=round(sensitivity, 4),
         optimal_trust_specificity=round(specificity, 4),
@@ -409,10 +423,15 @@ def generate_roc_figure(
         label=f"Trust score (AUROC = {result.auroc_trust_vs_failure:.3f})",
     )
 
+    best_rel_auroc = max(
+        result.auroc_reliability_lr or 0.0,
+        result.auroc_reliability_rf or 0.0,
+    )
+    best_rel_label = "LR" if (result.auroc_reliability_lr or 0.0) >= (result.auroc_reliability_rf or 0.0) else "RF"
     if (
         result.roc_fpr_reliability is not None
         and result.roc_tpr_reliability is not None
-        and result.auroc_reliability_mlp is not None
+        and best_rel_auroc > 0
     ):
         ax.plot(
             result.roc_fpr_reliability,
@@ -420,7 +439,7 @@ def generate_roc_figure(
             color="#16a34a",
             linewidth=2,
             linestyle="-.",
-            label=f"Reliability MLP (AUROC = {result.auroc_reliability_mlp:.3f})",
+            label=f"Reliability {best_rel_label} (AUROC = {best_rel_auroc:.3f})",
         )
 
     ax.plot([0, 1], [0, 1], linestyle="--", color="#9ca3af", linewidth=1, label="Chance")

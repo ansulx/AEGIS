@@ -125,10 +125,13 @@ class AegisSwinUNETR(nn.Module):
         return self.net(x)
 
     def enable_mc_dropout(self) -> None:
-        """Activate dropout layers for MC sampling while keeping BatchNorm in eval."""
+        """Activate dropout layers (including DropPath) for MC sampling while keeping BatchNorm in eval."""
         self.eval()
         for module in self.modules():
+            cls_name = type(module).__name__
             if isinstance(module, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
+                module.train()
+            elif cls_name == "DropPath":
                 module.train()
 
     def disable_mc_dropout(self) -> None:

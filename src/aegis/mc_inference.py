@@ -68,16 +68,16 @@ def mc_dropout_inference(
     completed = 0
     use_amp = device.type == "cuda"
 
+    def _predictor(patch: torch.Tensor) -> torch.Tensor:
+        if use_amp:
+            with torch.amp.autocast("cuda"):
+                return torch.sigmoid(model(patch))
+        return torch.sigmoid(model(patch))
+
     try:
         with torch.no_grad():
             for _ in range(mc_samples):
                 try:
-                    def _predictor(patch: torch.Tensor) -> torch.Tensor:
-                        if use_amp:
-                            with torch.amp.autocast("cuda"):
-                                return torch.sigmoid(model(patch))
-                        return torch.sigmoid(model(patch))
-
                     probs = sliding_window_inference(
                         inputs=x,
                         roi_size=patch_size,

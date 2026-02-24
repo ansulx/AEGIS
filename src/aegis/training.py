@@ -14,7 +14,7 @@ import nibabel as nib
 import numpy as np
 import torch
 import torch.nn as nn
-from monai.data import CacheDataset, DataLoader
+from monai.data import CacheDataset, Dataset, DataLoader
 from monai.losses import DiceFocalLoss
 from monai.metrics import DiceMetric
 from monai.transforms import (
@@ -161,8 +161,13 @@ def create_patch_dataset(
     patch_size: tuple[int, int, int],
     samples_per_volume: int,
     is_train: bool,
-) -> CacheDataset:
-    """Build a MONAI CacheDataset of patches from session pairs."""
+) -> CacheDataset | Dataset:
+    """Build a MONAI dataset of patches from session pairs.
+
+    Training uses a regular Dataset so random augmentations are freshly
+    sampled every epoch (CacheDataset would freeze them after init).
+    Validation uses CacheDataset since transforms are deterministic.
+    """
     if not sessions:
         raise ValueError("sessions list must not be empty")
 
@@ -208,14 +213,14 @@ def create_patch_dataset(
             RandGaussianSmoothd(keys=["image"], prob=0.2, sigma_x=(0.5, 1.0), sigma_y=(0.5, 1.0), sigma_z=(0.5, 1.0)),
             ToTensord(keys=keys),
         ])
+        return Dataset(data=data_dicts, transform=transforms)
     else:
         transforms = Compose([
             EnsureChannelFirstd(keys=keys, channel_dim="no_channel"),
             SpatialPadd(keys=keys, spatial_size=patch_size),
             ToTensord(keys=keys),
         ])
-
-    return CacheDataset(data=data_dicts, transform=transforms, cache_rate=1.0, num_workers=4)
+        return CacheDataset(data=data_dicts, transform=transforms, cache_rate=1.0, num_workers=4)
 
 
 def _compute_val_dice(

@@ -67,8 +67,11 @@ def _resolve_existing_dir(parent: Path, candidates: Sequence[str], label: str) -
 
 
 def _is_supported(path: Path) -> bool:
-    name = path.name.lower()
-    return name.endswith(".nii") or name.endswith(".nii.gz")
+    name = path.name
+    if name.startswith("."):
+        return False
+    low = name.lower()
+    return low.endswith(".nii") or low.endswith(".nii.gz")
 
 
 def _scan_medical_files(folder: Path, label: str) -> list[Path]:

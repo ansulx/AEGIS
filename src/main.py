@@ -203,7 +203,7 @@ def _handle_full_run(args: argparse.Namespace) -> int:
     logging.info("=" * 60)
 
     skip_training = bool(getattr(args, "skip_training", False))
-    resume_path = args.resume_from
+    resume_path = (repo_root / args.resume_from).resolve() if args.resume_from else None
     if skip_training and resume_path is None:
         logging.error("--skip-training requires --resume-from <checkpoint>")
         return 1
