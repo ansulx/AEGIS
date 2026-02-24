@@ -87,16 +87,23 @@ class AegisSwinUNETR(nn.Module):
             torch.hub.download_url_to_file(PRETRAINED_URL, str(weight_path))
             logger.info("Downloaded to %s", weight_path)
 
-        pretrained = torch.load(str(weight_path), map_location="cpu", weights_only=True)
+        pretrained = torch.load(str(weight_path), map_location="cpu", weights_only=False)
+
+        if isinstance(pretrained, dict):
+            for nested_key in ("state_dict", "model", "model_state_dict"):
+                if nested_key in pretrained:
+                    pretrained = pretrained[nested_key]
+                    break
 
         model_dict = self.net.state_dict()
         loaded = 0
         skipped = 0
         for key, value in pretrained.items():
-            mapped_key = _map_pretrained_key(key)
-            if mapped_key in model_dict and model_dict[mapped_key].shape == value.shape:
-                model_dict[mapped_key] = value
-                loaded += 1
+            for mapped_key in _candidate_keys(key):
+                if mapped_key in model_dict and model_dict[mapped_key].shape == value.shape:
+                    model_dict[mapped_key] = value
+                    loaded += 1
+                    break
             else:
                 skipped += 1
 
@@ -129,10 +136,17 @@ class AegisSwinUNETR(nn.Module):
         self.eval()
 
 
-def _map_pretrained_key(key: str) -> str:
-    """Map keys from the MONAI pre-trained checkpoint to SwinUNETR's swinViT."""
-    if key.startswith("module."):
-        key = key[len("module."):]
-    if not key.startswith("swinViT."):
-        key = "swinViT." + key
-    return key
+def _candidate_keys(key: str) -> list[str]:
+    """Generate candidate mapped keys for a pre-trained checkpoint key."""
+    base = key
+    if base.startswith("module."):
+        base = base[len("module."):]
+
+    candidates = [
+        base,
+        "swinViT." + base,
+    ]
+    if base.startswith("swinViT."):
+        candidates.append(base[len("swinViT."):])
+
+    return candidates

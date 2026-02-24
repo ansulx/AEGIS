@@ -301,7 +301,7 @@ def train_model(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-7, verbose=False
+        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-7,
     )
 
     start_epoch = 0
