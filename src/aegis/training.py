@@ -385,14 +385,9 @@ def train_model(
                 )
                 break
 
-        if (epoch + 1) % 10 == 0:
-            periodic_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"
-            save_checkpoint(
-                periodic_path, model, optimizer, scheduler, epoch, best_dice, config_dict
-            )
-
-        latest_path = checkpoint_dir / "latest_model.pt"
-        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, best_dice, config_dict)
+        if (epoch + 1) % config.val_interval == 0:
+            latest_path = checkpoint_dir / "latest_model.pt"
+            save_checkpoint(latest_path, model, optimizer, scheduler, epoch, best_dice, config_dict)
 
     if not best_checkpoint_path.exists():
         save_checkpoint(
