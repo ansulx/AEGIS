@@ -31,6 +31,11 @@ pipeline:
   failure_dice_threshold: 0.1
   generate_figures: true
   run_failure_analysis: true
+  run_reliability_module: true
+
+  # MC inference tuning
+  mc_samples_train: 5
+  sw_batch_size: 8
 
 execution:
   output_root: "outputs"

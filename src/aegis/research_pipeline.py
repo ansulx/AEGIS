@@ -27,6 +27,11 @@ from .data_loading import DatasetBundle, DatasetLoadError, SessionPair, load_dat
 from .failure_detection import run_full_failure_analysis
 from .mc_inference import MCResult, mc_dropout_inference
 from .models.swin_unetr import AegisSwinUNETR
+from .reliability_module import (
+    ReliabilityFeatures,
+    extract_reliability_features,
+    train_and_evaluate_reliability,
+)
 from .training import TrainingConfig, load_and_normalize_nifti, train_model
 from .visualization import generate_all_figures
 
@@ -68,6 +73,7 @@ class PipelineConfig:
     failure_dice_threshold: float = 0.1
     generate_figures: bool = True
     run_failure_analysis: bool = True
+    run_reliability_module: bool = True
 
     def __post_init__(self) -> None:
         if not 0.5 <= self.adam_train_fraction < 1.0:
@@ -198,6 +204,7 @@ def _run_mc_inference_on_session(
     device: torch.device,
     outputs_dir: Path,
     rows: list[dict[str, Any]],
+    rel_features: list[ReliabilityFeatures] | None = None,
     has_gt: bool = True,
     mc_samples_override: int | None = None,
 ) -> None:
@@ -225,6 +232,17 @@ def _run_mc_inference_on_session(
                 f"mask {gt_mask.shape} vs pred {result.pred_mask.shape}."
             )
         metrics = compute_segmentation_metrics(result.pred_mask, gt_mask)
+
+    if rel_features is not None:
+        rel_features.append(extract_reliability_features(
+            image=image_np,
+            pred_mask=result.pred_mask,
+            entropy=result.entropy,
+            trust_score=result.trust_score,
+            volume_fraction_std=result.volume_fraction_std,
+            session_id=session.session_id,
+            cohort=cohort_name,
+        ))
 
     predictions_dir = _ensure_dir(outputs_dir / "predictions" / cohort_name)
     uncertainty_dir = _ensure_dir(outputs_dir / "uncertainty" / cohort_name)
@@ -269,6 +287,7 @@ def _run_mc_inference_on_image_only(
     device: torch.device,
     outputs_dir: Path,
     rows: list[dict[str, Any]],
+    rel_features: list[ReliabilityFeatures] | None = None,
 ) -> None:
     image_np, affine = _load_nifti(image_path)
     volume_tensor, _ = load_and_normalize_nifti(image_path, device)
@@ -282,6 +301,17 @@ def _run_mc_inference_on_image_only(
         patch_size=tuple(config.patch_size),
         sw_batch_size=config.sw_batch_size,
     )
+
+    if rel_features is not None:
+        rel_features.append(extract_reliability_features(
+            image=image_np,
+            pred_mask=result.pred_mask,
+            entropy=result.entropy,
+            trust_score=result.trust_score,
+            volume_fraction_std=result.volume_fraction_std,
+            session_id=session_id,
+            cohort=cohort_name,
+        ))
 
     predictions_dir = _ensure_dir(outputs_dir / "predictions" / cohort_name)
     uncertainty_dir = _ensure_dir(outputs_dir / "uncertainty" / cohort_name)
@@ -330,10 +360,12 @@ def _write_case_rows_csv(rows: list[dict[str, Any]], path: Path) -> None:
     fieldnames = [
         "cohort", "session_id", "has_ground_truth",
         "dice", "iou", "sensitivity", "specificity", "precision",
-        "trust_score", "volume_fraction_std", "qualitative_slice_index",
+        "trust_score", "volume_fraction_std",
+        "reliability_score_lr", "reliability_score_mlp",
+        "qualitative_slice_index",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -423,6 +455,9 @@ def run_research_pipeline(
     model.eval()
 
     case_rows: list[dict[str, Any]] = []
+    rel_features_adam: list[ReliabilityFeatures] = []
+    rel_features_indian: list[ReliabilityFeatures] = []
+    rel_features_ncar: list[ReliabilityFeatures] = []
 
     import time as _time
 
@@ -434,6 +469,7 @@ def run_research_pipeline(
         t0 = _time.monotonic()
         _run_mc_inference_on_session(
             model, session, "adam_train", cfg, device, out, case_rows,
+            rel_features=rel_features_adam,
             mc_samples_override=cfg.mc_samples_train,
         )
         logger.info("  [%d/%d] %s done (%.1fs)", i, len(adam_train), session.session_id, _time.monotonic() - t0)
@@ -444,7 +480,10 @@ def run_research_pipeline(
     )
     for i, session in enumerate(sorted(adam_holdout, key=lambda s: s.session_id), 1):
         t0 = _time.monotonic()
-        _run_mc_inference_on_session(model, session, "adam_holdout", cfg, device, out, case_rows)
+        _run_mc_inference_on_session(
+            model, session, "adam_holdout", cfg, device, out, case_rows,
+            rel_features=rel_features_adam,
+        )
         logger.info("  [%d/%d] %s done (%.1fs)", i, len(adam_holdout), session.session_id, _time.monotonic() - t0)
 
     logger.info(
@@ -454,7 +493,8 @@ def run_research_pipeline(
     for i, session in enumerate(sorted(bundle.indian_car_sessions, key=lambda s: s.session_id), 1):
         t0 = _time.monotonic()
         _run_mc_inference_on_session(
-            model, session, "indian_car_inference_only", cfg, device, out, case_rows
+            model, session, "indian_car_inference_only", cfg, device, out, case_rows,
+            rel_features=rel_features_indian,
         )
         logger.info("  [%d/%d] %s done (%.1fs)", i, len(bundle.indian_car_sessions), session.session_id, _time.monotonic() - t0)
 
@@ -468,8 +508,50 @@ def run_research_pipeline(
         _run_mc_inference_on_image_only(
             model, image_path, session_id,
             "indian_ncar_inference_only", cfg, device, out, case_rows,
+            rel_features=rel_features_ncar,
         )
         logger.info("  [%d/%d] %s done (%.1fs)", i, len(bundle.indian_ncar_images), session_id, _time.monotonic() - t0)
+
+    # --- Reliability prediction module ---
+    reliability_result = None
+    if cfg.run_reliability_module:
+        try:
+            dice_adam = [
+                float(r["dice"]) if r.get("dice") is not None else 0.0
+                for r in case_rows
+                if r["cohort"] in ("adam_train", "adam_holdout") and r.get("has_ground_truth")
+            ]
+            dice_indian = [
+                float(r["dice"]) if r.get("dice") is not None else 0.0
+                for r in case_rows
+                if r["cohort"] == "indian_car_inference_only" and r.get("has_ground_truth")
+            ]
+
+            reliability_result = train_and_evaluate_reliability(
+                features_adam=rel_features_adam,
+                dice_scores_adam=dice_adam,
+                features_indian=rel_features_indian if rel_features_indian else None,
+                dice_scores_indian=dice_indian if dice_indian else None,
+                features_inference_only=rel_features_ncar if rel_features_ncar else None,
+                failure_dice_threshold=cfg.failure_dice_threshold,
+            )
+
+            pred_lookup = {
+                (p.session_id, p.cohort): p for p in reliability_result.predictions
+            }
+            for row in case_rows:
+                key = (row["session_id"], row["cohort"])
+                pred = pred_lookup.get(key)
+                if pred:
+                    row["reliability_score_lr"] = pred.reliability_score_lr
+                    row["reliability_score_mlp"] = pred.reliability_score_mlp
+
+            logger.info(
+                "Reliability module complete. CV AUROC — LR: %.4f, MLP: %.4f",
+                reliability_result.auroc_lr_cv, reliability_result.auroc_mlp_cv,
+            )
+        except Exception:
+            logger.warning("Reliability module failed.", exc_info=True)
 
     per_case_csv = reports_dir / "per_case_metrics.csv"
     _write_case_rows_csv(case_rows, per_case_csv)
@@ -514,7 +596,16 @@ def run_research_pipeline(
 
     if cfg.generate_figures:
         try:
-            figure_paths = generate_all_figures(out)
+            feat_imp = (
+                reliability_result.feature_importances
+                if reliability_result is not None
+                else None
+            )
+            figure_paths = generate_all_figures(
+                out,
+                feature_importances=feat_imp,
+                failure_dice_threshold=cfg.failure_dice_threshold,
+            )
             summary["artifacts"]["figures"] = [str(p) for p in figure_paths]
             logger.info("Generated %d publication figures.", len(figure_paths))
         except Exception:
@@ -527,6 +618,8 @@ def run_research_pipeline(
             )
             summary["failure_analysis"] = {
                 "auroc_trust_vs_failure": fa_result.auroc_trust_vs_failure,
+                "auroc_reliability_lr": fa_result.auroc_reliability_lr,
+                "auroc_reliability_mlp": fa_result.auroc_reliability_mlp,
                 "optimal_trust_threshold": fa_result.optimal_trust_threshold,
                 "workload_reduction_fraction": fa_result.workload_reduction_fraction,
                 "missed_failure_rate": fa_result.missed_failure_rate,
@@ -534,6 +627,18 @@ def run_research_pipeline(
             logger.info("Failure analysis complete. AUROC=%.4f", fa_result.auroc_trust_vs_failure)
         except Exception:
             logger.warning("Failure analysis failed.", exc_info=True)
+
+    if reliability_result is not None:
+        summary["reliability_module"] = {
+            "auroc_lr_cv_adam": reliability_result.auroc_lr_cv,
+            "auroc_mlp_cv_adam": reliability_result.auroc_mlp_cv,
+            "auroc_lr_indian": reliability_result.auroc_lr_indian,
+            "auroc_mlp_indian": reliability_result.auroc_mlp_indian,
+            "n_train_cases": reliability_result.n_train_cases,
+            "n_positive_train": reliability_result.n_positive_train,
+            "n_indian_cases": reliability_result.n_indian_cases,
+            "feature_importances": reliability_result.feature_importances,
+        }
 
     summary_path = reports_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
