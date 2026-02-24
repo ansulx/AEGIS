@@ -41,7 +41,7 @@ def save_checkpoint(
 
     tmp_path = path.with_suffix(".tmp")
     try:
-        torch.save(payload, tmp_path)
+        torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
         os.replace(tmp_path, path)
     except BaseException:
         if tmp_path.exists():
