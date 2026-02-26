@@ -8,15 +8,16 @@ pipeline:
   require_gpu: true
 
   # Training
-  num_epochs: 100
-  batch_size: 1
-  learning_rate: 0.0001
+  num_epochs: 200
+  batch_size: 2
+  learning_rate: 0.0002
   weight_decay: 0.00001
   patch_size: [96, 96, 96]
   samples_per_volume: 4
   val_interval: 5
-  early_stopping_patience: 15
+  early_stopping_patience: 30
   gradient_clip_max_norm: 1.0
+  warmup_epochs: 10
 
   # Model
   img_size: [96, 96, 96]
@@ -24,11 +25,17 @@ pipeline:
   drop_rate: 0.1
   attn_drop_rate: 0.1
   dropout_path_rate: 0.1
+  use_pretrained: true
 
   # Analysis
-  failure_dice_threshold: 0.5
+  failure_dice_threshold: 0.1
   generate_figures: true
   run_failure_analysis: true
+  run_reliability_module: true
+
+  # MC inference tuning
+  mc_samples_train: 5
+  sw_batch_size: 8
 
 execution:
   output_root: "outputs"

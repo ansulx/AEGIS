@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from monai.networks.nets import SwinUNETR
+
+logger = logging.getLogger(__name__)
+
+PRETRAINED_URL = (
+    "https://github.com/Project-MONAI/MONAI-extra-test-data/releases/"
+    "download/0.8.1/model_swinvit.pt"
+)
 
 
 class AegisSwinUNETR(nn.Module):
@@ -24,6 +35,7 @@ class AegisSwinUNETR(nn.Module):
         attn_drop_rate: float = 0.1,
         dropout_path_rate: float = 0.1,
         spatial_dims: int = 3,
+        use_pretrained: bool = False,
     ) -> None:
         super().__init__()
         if in_channels < 1:
@@ -42,16 +54,63 @@ class AegisSwinUNETR(nn.Module):
         self.out_channels = out_channels
         self.img_size = img_size
 
-        self.net = SwinUNETR(
-            img_size=img_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            feature_size=feature_size,
-            drop_rate=drop_rate,
-            attn_drop_rate=attn_drop_rate,
-            dropout_path_rate=dropout_path_rate,
-            spatial_dims=spatial_dims,
-            use_v2=True,
+        sig = inspect.signature(SwinUNETR.__init__)
+        params = set(sig.parameters.keys())
+
+        kwargs: dict = {
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "feature_size": feature_size,
+            "drop_rate": drop_rate,
+            "attn_drop_rate": attn_drop_rate,
+            "dropout_path_rate": dropout_path_rate,
+            "spatial_dims": spatial_dims,
+        }
+        if "img_size" in params:
+            kwargs["img_size"] = img_size
+        if "use_v2" in params:
+            kwargs["use_v2"] = True
+
+        self.net = SwinUNETR(**kwargs)
+
+        if use_pretrained:
+            self._load_pretrained_backbone()
+
+    def _load_pretrained_backbone(self) -> None:
+        """Load self-supervised pre-trained ViT backbone weights from MONAI."""
+        cache_dir = Path.home() / ".cache" / "aegis"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        weight_path = cache_dir / "model_swinvit.pt"
+
+        if not weight_path.exists():
+            logger.info("Downloading pre-trained SwinViT weights...")
+            torch.hub.download_url_to_file(PRETRAINED_URL, str(weight_path))
+            logger.info("Downloaded to %s", weight_path)
+
+        pretrained = torch.load(str(weight_path), map_location="cpu", weights_only=False)
+
+        if isinstance(pretrained, dict):
+            for nested_key in ("state_dict", "model", "model_state_dict"):
+                if nested_key in pretrained:
+                    pretrained = pretrained[nested_key]
+                    break
+
+        model_dict = self.net.state_dict()
+        loaded = 0
+        skipped = 0
+        for key, value in pretrained.items():
+            for mapped_key in _candidate_keys(key):
+                if mapped_key in model_dict and model_dict[mapped_key].shape == value.shape:
+                    model_dict[mapped_key] = value
+                    loaded += 1
+                    break
+            else:
+                skipped += 1
+
+        self.net.load_state_dict(model_dict)
+        logger.info(
+            "Loaded %d/%d pre-trained backbone parameters (skipped %d)",
+            loaded, loaded + skipped, skipped,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -66,12 +125,31 @@ class AegisSwinUNETR(nn.Module):
         return self.net(x)
 
     def enable_mc_dropout(self) -> None:
-        """Activate dropout layers for MC sampling while keeping BatchNorm in eval."""
+        """Activate dropout layers (including DropPath) for MC sampling while keeping BatchNorm in eval."""
         self.eval()
         for module in self.modules():
+            cls_name = type(module).__name__
             if isinstance(module, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
+                module.train()
+            elif cls_name == "DropPath":
                 module.train()
 
     def disable_mc_dropout(self) -> None:
         """Restore standard eval mode for all layers."""
         self.eval()
+
+
+def _candidate_keys(key: str) -> list[str]:
+    """Generate candidate mapped keys for a pre-trained checkpoint key."""
+    base = key
+    if base.startswith("module."):
+        base = base[len("module."):]
+
+    candidates = [
+        base,
+        "swinViT." + base,
+    ]
+    if base.startswith("swinViT."):
+        candidates.append(base[len("swinViT."):])
+
+    return candidates

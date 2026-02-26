@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 class FailureDetectionResult:
     auroc_trust_vs_failure: float
     auroc_vfstd_vs_failure: float
+    auroc_reliability_lr: float | None
+    auroc_reliability_mlp: float | None
+    auroc_reliability_rf: float | None
     optimal_trust_threshold: float
     optimal_trust_sensitivity: float
     optimal_trust_specificity: float
@@ -47,6 +50,8 @@ class FailureDetectionResult:
     missed_failure_rate: float
     roc_fpr: list[float]
     roc_tpr: list[float]
+    roc_fpr_reliability: list[float] | None
+    roc_tpr_reliability: list[float] | None
     per_cohort_results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -102,15 +107,23 @@ def _load_cases(per_case_csv_path: Path) -> list[dict[str, Any]]:
             if dice is None or trust is None:
                 continue
 
-            rows.append(
-                {
-                    "cohort": (raw.get("cohort") or "unknown").strip(),
-                    "session_id": (raw.get("session_id") or "").strip(),
-                    "dice": dice,
-                    "trust_score": trust,
-                    "volume_fraction_std": vfstd if vfstd is not None else 0.0,
-                }
-            )
+            row_dict: dict[str, Any] = {
+                "cohort": (raw.get("cohort") or "unknown").strip(),
+                "session_id": (raw.get("session_id") or "").strip(),
+                "dice": dice,
+                "trust_score": trust,
+                "volume_fraction_std": vfstd if vfstd is not None else 0.0,
+            }
+            rel_lr = _safe_float(raw.get("reliability_score_lr"))
+            rel_mlp = _safe_float(raw.get("reliability_score_mlp"))
+            rel_rf = _safe_float(raw.get("reliability_score_rf"))
+            if rel_lr is not None:
+                row_dict["reliability_score_lr"] = rel_lr
+            if rel_mlp is not None:
+                row_dict["reliability_score_mlp"] = rel_mlp
+            if rel_rf is not None:
+                row_dict["reliability_score_rf"] = rel_rf
+            rows.append(row_dict)
 
     return rows
 
@@ -217,6 +230,9 @@ def run_failure_detection_analysis(
         return FailureDetectionResult(
             auroc_trust_vs_failure=1.0,
             auroc_vfstd_vs_failure=1.0,
+            auroc_reliability_lr=None,
+            auroc_reliability_mlp=None,
+            auroc_reliability_rf=None,
             optimal_trust_threshold=0.0,
             optimal_trust_sensitivity=1.0,
             optimal_trust_specificity=1.0,
@@ -227,6 +243,8 @@ def run_failure_detection_analysis(
             missed_failure_rate=0.0,
             roc_fpr=[0.0, 1.0],
             roc_tpr=[0.0, 1.0],
+            roc_fpr_reliability=None,
+            roc_tpr_reliability=None,
             per_cohort_results={},
         )
 
@@ -235,6 +253,9 @@ def run_failure_detection_analysis(
         return FailureDetectionResult(
             auroc_trust_vs_failure=0.5,
             auroc_vfstd_vs_failure=0.5,
+            auroc_reliability_lr=None,
+            auroc_reliability_mlp=None,
+            auroc_reliability_rf=None,
             optimal_trust_threshold=1.0,
             optimal_trust_sensitivity=1.0,
             optimal_trust_specificity=0.0,
@@ -245,6 +266,8 @@ def run_failure_detection_analysis(
             missed_failure_rate=0.0,
             roc_fpr=[0.0, 1.0],
             roc_tpr=[0.0, 1.0],
+            roc_fpr_reliability=None,
+            roc_tpr_reliability=None,
             per_cohort_results={},
         )
 
@@ -284,9 +307,47 @@ def run_failure_detection_analysis(
     for cohort_name, cohort_cases in sorted(cohorts.items()):
         per_cohort[cohort_name] = _cohort_metrics(cohort_cases, failure_dice_threshold)
 
+    # --- Reliability score AUROC (if column present) -----------------------
+    auroc_rel_lr: float | None = None
+    auroc_rel_mlp: float | None = None
+    auroc_rel_rf: float | None = None
+    roc_fpr_rel: list[float] | None = None
+    roc_tpr_rel: list[float] | None = None
+
+    has_reliability = all(
+        c.get("reliability_score_lr") is not None for c in cases
+    )
+    if has_reliability:
+        rel_lr = np.array([float(c["reliability_score_lr"]) for c in cases])
+        rel_mlp = np.array([float(c.get("reliability_score_mlp", 0.5)) for c in cases])
+        rel_rf = np.array([float(c.get("reliability_score_rf", 0.5)) for c in cases])
+        auroc_rel_lr = round(_compute_auroc(labels, 1.0 - rel_lr), 4)
+        auroc_rel_mlp = round(_compute_auroc(labels, 1.0 - rel_mlp), 4)
+        auroc_rel_rf = round(_compute_auroc(labels, 1.0 - rel_rf), 4)
+        best_auroc = max(
+            auroc_rel_lr if not math.isnan(auroc_rel_lr) else 0.0,
+            auroc_rel_rf if auroc_rel_rf is not None and not math.isnan(auroc_rel_rf) else 0.0,
+        )
+        if best_auroc == auroc_rel_lr:
+            best_rel_scores = rel_lr
+            best_rel_name = "LR"
+        else:
+            best_rel_scores = rel_rf
+            best_rel_name = "RF"
+        fpr_rel, tpr_rel, _ = roc_curve(labels, 1.0 - best_rel_scores)
+        roc_fpr_rel = [round(float(x), 6) for x in fpr_rel]
+        roc_tpr_rel = [round(float(x), 6) for x in tpr_rel]
+        logger.info(
+            "Failure detection AUROC — trust: %.4f, rel_lr: %.4f, rel_mlp: %.4f, rel_rf: %.4f (best curve: %s)",
+            auroc_trust, auroc_rel_lr, auroc_rel_mlp, auroc_rel_rf, best_rel_name,
+        )
+
     return FailureDetectionResult(
         auroc_trust_vs_failure=round(auroc_trust, 4),
         auroc_vfstd_vs_failure=round(auroc_vfstd, 4),
+        auroc_reliability_lr=auroc_rel_lr,
+        auroc_reliability_mlp=auroc_rel_mlp,
+        auroc_reliability_rf=auroc_rel_rf,
         optimal_trust_threshold=round(optimal_trust_threshold, 4),
         optimal_trust_sensitivity=round(sensitivity, 4),
         optimal_trust_specificity=round(specificity, 4),
@@ -297,6 +358,8 @@ def run_failure_detection_analysis(
         missed_failure_rate=round(missed_failure_rate, 4),
         roc_fpr=[round(float(x), 6) for x in fpr],
         roc_tpr=[round(float(x), 6) for x in tpr],
+        roc_fpr_reliability=roc_fpr_rel,
+        roc_tpr_reliability=roc_tpr_rel,
         per_cohort_results=per_cohort,
     )
 
@@ -359,6 +422,26 @@ def generate_roc_figure(
         linewidth=2,
         label=f"Trust score (AUROC = {result.auroc_trust_vs_failure:.3f})",
     )
+
+    best_rel_auroc = max(
+        result.auroc_reliability_lr or 0.0,
+        result.auroc_reliability_rf or 0.0,
+    )
+    best_rel_label = "LR" if (result.auroc_reliability_lr or 0.0) >= (result.auroc_reliability_rf or 0.0) else "RF"
+    if (
+        result.roc_fpr_reliability is not None
+        and result.roc_tpr_reliability is not None
+        and best_rel_auroc > 0
+    ):
+        ax.plot(
+            result.roc_fpr_reliability,
+            result.roc_tpr_reliability,
+            color="#16a34a",
+            linewidth=2,
+            linestyle="-.",
+            label=f"Reliability {best_rel_label} (AUROC = {best_rel_auroc:.3f})",
+        )
+
     ax.plot([0, 1], [0, 1], linestyle="--", color="#9ca3af", linewidth=1, label="Chance")
 
     opt_fpr = 1.0 - result.optimal_trust_specificity

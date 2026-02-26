@@ -10,6 +10,11 @@ __version__ = "0.1.0"
 from .data_loading import DatasetBundle, DatasetLoadError, SessionPair, load_dataset_bundle
 from .guardrails import Guardrail
 from .monitor import ClinicalMonitor
+from .reliability_module import (
+    ReliabilityModuleResult,
+    extract_reliability_features,
+    train_and_evaluate_reliability,
+)
 from .research_pipeline import PipelineConfig, run_research_pipeline
 
 __all__ = [
@@ -22,4 +27,7 @@ __all__ = [
     "load_dataset_bundle",
     "PipelineConfig",
     "run_research_pipeline",
+    "ReliabilityModuleResult",
+    "extract_reliability_features",
+    "train_and_evaluate_reliability",
 ]

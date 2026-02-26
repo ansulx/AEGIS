@@ -308,6 +308,7 @@ def generate_best_worst_gallery(
     gt_df = gt_df.sort_values("dice", ascending=False)
     best = gt_df.head(n_cases)
     worst = gt_df.tail(n_cases).iloc[::-1]
+    best_ids = set(best["session_id"].tolist())
     selected = pd.concat([best, worst], ignore_index=True)
 
     loaded_rows: list[dict[str, Any]] = []
@@ -329,7 +330,7 @@ def generate_best_worst_gallery(
             "pred": data["pred_slice"],
             "uncertainty": data["uncertainty_slice"],
             "gt": data["gt_slice"] if "gt_slice" in data else None,
-            "is_best": len(loaded_rows) < n_cases,
+            "is_best": sid in best_ids,
         })
 
     if not loaded_rows:
@@ -401,10 +402,144 @@ def generate_best_worst_gallery(
 
 
 # ---------------------------------------------------------------------------
-# 5. Orchestrator
+# 5. ROC comparison: trust score vs learned reliability
 # ---------------------------------------------------------------------------
 
-def generate_all_figures(output_dir: Path | str) -> list[Path]:
+def generate_roc_comparison_figure(
+    per_case_csv_path: Path | str,
+    out_path: Path | str,
+    failure_dice_threshold: float = 0.1,
+) -> Path:
+    """Overlay ROC curves for trust_score, reliability_lr, and reliability_mlp."""
+    from sklearn.metrics import roc_auc_score, roc_curve as sk_roc_curve
+
+    per_case_csv_path = Path(per_case_csv_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(per_case_csv_path)
+    df["has_ground_truth"] = df["has_ground_truth"].astype(str).str.lower().isin(["true", "1"])
+    gt_df = df[df["has_ground_truth"]].dropna(subset=["dice", "trust_score"]).copy()
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    if gt_df.empty or gt_df["dice"].nunique() < 2:
+        ax.text(0.5, 0.5, "Insufficient data for ROC comparison",
+                transform=ax.transAxes, ha="center", fontsize=12)
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    labels = (gt_df["dice"] < failure_dice_threshold).astype(int).values
+
+    if len(np.unique(labels)) < 2:
+        ax.text(0.5, 0.5, "Only one class present — ROC undefined",
+                transform=ax.transAxes, ha="center", fontsize=12)
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    trust_scores = 1.0 - gt_df["trust_score"].values
+    fpr_t, tpr_t, _ = sk_roc_curve(labels, trust_scores)
+    auc_t = roc_auc_score(labels, trust_scores)
+    ax.plot(fpr_t, tpr_t, color="#1f77b4", lw=2.0,
+            label=f"Trust Score (AUROC = {auc_t:.3f})")
+
+    has_lr = "reliability_score_lr" in gt_df.columns and gt_df["reliability_score_lr"].notna().all()
+    has_mlp = "reliability_score_mlp" in gt_df.columns and gt_df["reliability_score_mlp"].notna().all()
+    has_rf = "reliability_score_rf" in gt_df.columns and gt_df["reliability_score_rf"].notna().all()
+
+    if has_lr:
+        rel_lr = 1.0 - gt_df["reliability_score_lr"].values
+        fpr_lr, tpr_lr, _ = sk_roc_curve(labels, rel_lr)
+        auc_lr = roc_auc_score(labels, rel_lr)
+        ax.plot(fpr_lr, tpr_lr, color="#ff7f0e", lw=2.0, linestyle="--",
+                label=f"Reliability LR (AUROC = {auc_lr:.3f})")
+
+    if has_mlp:
+        rel_mlp = 1.0 - gt_df["reliability_score_mlp"].values
+        fpr_mlp, tpr_mlp, _ = sk_roc_curve(labels, rel_mlp)
+        auc_mlp = roc_auc_score(labels, rel_mlp)
+        ax.plot(fpr_mlp, tpr_mlp, color="#2ca02c", lw=2.0, linestyle="-.",
+                label=f"Reliability MLP (AUROC = {auc_mlp:.3f})")
+
+    if has_rf:
+        rel_rf = 1.0 - gt_df["reliability_score_rf"].values
+        fpr_rf, tpr_rf, _ = sk_roc_curve(labels, rel_rf)
+        auc_rf = roc_auc_score(labels, rel_rf)
+        ax.plot(fpr_rf, tpr_rf, color="#d62728", lw=2.0, linestyle="-",
+                label=f"Reliability RF (AUROC = {auc_rf:.3f})")
+
+    ax.plot([0, 1], [0, 1], "k:", lw=0.8, alpha=0.5, label="Random")
+    ax.set_xlabel("False Positive Rate", fontsize=11)
+    ax.set_ylabel("True Positive Rate", fontsize=11)
+    ax.set_title("Failure Detection: ROC Comparison", fontsize=13)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_aspect("equal")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# 6. Feature importance bar chart
+# ---------------------------------------------------------------------------
+
+def generate_feature_importance_figure(
+    feature_importances: dict[str, float],
+    out_path: Path | str,
+    rf_feature_importances: dict[str, float] | None = None,
+) -> Path:
+    """Horizontal bar chart of feature importances for the reliability module."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    has_rf = rf_feature_importances is not None and len(rf_feature_importances) > 0
+    ncols = 2 if has_rf else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, max(4, len(feature_importances) * 0.35)))
+    if ncols == 1:
+        axes = [axes]
+
+    for ax, imp, title, cmap_name in [
+        (axes[0], feature_importances, "Feature Importances (LR)", "viridis"),
+    ] + ([
+        (axes[1], rf_feature_importances, "Feature Importances (RF)", "plasma"),
+    ] if has_rf else []):
+        sorted_feat = sorted(imp.items(), key=lambda x: x[1], reverse=True)
+        names = [f[0] for f in sorted_feat]
+        values = [f[1] for f in sorted_feat]
+        colors = getattr(plt.cm, cmap_name)(np.linspace(0.3, 0.9, len(names)))
+        bars = ax.barh(range(len(names)), values, color=colors, edgecolor="k", linewidth=0.3)
+        ax.set_yticks(range(len(names)))
+        ax.set_yticklabels(names, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel("Relative Importance", fontsize=10)
+        ax.set_title(title, fontsize=12)
+        for bar, val in zip(bars, values):
+            if val > 0.01:
+                ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
+                        f"{val:.3f}", va="center", fontsize=7)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# 7. Orchestrator
+# ---------------------------------------------------------------------------
+
+def generate_all_figures(
+    output_dir: Path | str,
+    feature_importances: dict[str, float] | None = None,
+    rf_feature_importances: dict[str, float] | None = None,
+    failure_dice_threshold: float = 0.1,
+) -> list[Path]:
     """Generate all publication figures from pipeline outputs.
 
     Expected layout under *output_dir*:
@@ -497,6 +632,27 @@ def generate_all_figures(output_dir: Path | str) -> list[Path]:
                     generated.append(path)
                 except Exception:
                     logger.warning("Failed to generate best/worst gallery.", exc_info=True)
+
+            # --- ROC comparison (trust vs learned reliability) ---
+            try:
+                path = generate_roc_comparison_figure(
+                    csv_path, figures_dir / "roc_comparison.png",
+                    failure_dice_threshold=failure_dice_threshold,
+                )
+                generated.append(path)
+            except Exception:
+                logger.warning("Failed to generate ROC comparison figure.", exc_info=True)
+
+            # --- Feature importance ---
+            if feature_importances:
+                try:
+                    path = generate_feature_importance_figure(
+                        feature_importances, figures_dir / "feature_importances.png",
+                        rf_feature_importances=rf_feature_importances,
+                    )
+                    generated.append(path)
+                except Exception:
+                    logger.warning("Failed to generate feature importance figure.", exc_info=True)
     else:
         logger.warning("Per-case CSV not found at %s – skipping all summary figures.", csv_path)
 
